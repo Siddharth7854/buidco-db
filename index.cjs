@@ -17,14 +17,14 @@ app.get('/', (req, res) => {
   res.send('BLMS API is running');
 });
 
-// PostgreSQL Connection
+// PostgreSQL Connection (use Railway environment variables)
 const pool = new Pool({
-  user: 'buidco_user',
-  host: 'dpg-d1ojnc2dbo4c73b5egcg-a',
-  database: 'buidco_leave_lfur',
-  password: 'f0hoXziTaxZhCd5RneXWG4UFul48WIZr',
-  port: 5432,
-  ssl: { rejectUnauthorized: false }
+  user: process.env.PGUSER || process.env.POSTGRES_USER || 'postgres',
+  host: process.env.PGHOST || process.env.POSTGRES_HOST || 'localhost',
+  database: process.env.PGDATABASE || process.env.POSTGRES_DB || 'postgres',
+  password: process.env.PGPASSWORD || process.env.POSTGRES_PASSWORD || '',
+  port: process.env.PGPORT ? parseInt(process.env.PGPORT) : (process.env.POSTGRES_PORT ? parseInt(process.env.POSTGRES_PORT) : 5432),
+  ssl: process.env.PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false
 });
 
 // Test database connection
