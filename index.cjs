@@ -14,11 +14,12 @@ app.use(express.json());
 
 // PostgreSQL Connection
 const pool = new Pool({
-  user: 'postgres',
-  host: 'localhost',
+  user: 'buidco_user',
+  host: 'dpg-d1gc1cvfte5s738f92rg-a.singapore-postgres.render.com',
   database: 'buidco_leave',
-  password: 'sid91221',
-  port: 5432,
+  password: 'JSC2DpXEZDlRDZwx4SS0rKuCQrEwNUTb',
+  port: 5423,
+  ssl: { rejectUnauthorized: false }
 });
 
 // Test database connection
@@ -59,7 +60,30 @@ const profilePhotoStorage = multer.diskStorage({
 const uploadProfilePhoto = multer({ storage: profilePhotoStorage });
 
 // Serve uploaded profile photos statically
+
+// Serve uploaded profile photos statically
 app.use('/uploads/profile_photos', express.static(path.join(__dirname, 'uploads/profile_photos')));
+// Serve uploaded leave documents statically
+app.use('/uploads/leave_docs', express.static(path.join(__dirname, 'uploads/leave_docs')));
+// --- Global error handler to ensure all errors return JSON ---
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  if (res.headersSent) {
+    return next(err);
+  }
+  // If body-parser JSON parse error
+  if (err.type === 'entity.parse.failed') {
+    return res.status(400).json({
+      success: false,
+      error: 'Invalid JSON in request body',
+      details: err.message
+    });
+  }
+  res.status(err.status || 500).json({
+    success: false,
+    error: err.message || 'Internal Server Error',
+  });
+});
 
 // Create tables if they don't exist
 async function createTables() {
@@ -149,11 +173,6 @@ addBalanceColumns();
 // Ensure cancel_request_status and cancel_reason columns exist
 (async () => {
   try {
-    await pool.query(`
-      ALTER TABLE leaves
-      ADD COLUMN IF NOT EXISTS cancel_request_status VARCHAR(20),
-      ADD COLUMN IF NOT EXISTS cancel_reason TEXT;
-    `);
     // Create notifications table if not exists
     await pool.query(`
       CREATE TABLE IF NOT EXISTS notifications (
@@ -162,7 +181,10 @@ addBalanceColumns();
         message TEXT,
         is_read BOOLEAN DEFAULT FALSE,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        user_id INTEGER
+        user_id INTEGER,
+        sender_id VARCHAR(50),
+        sender_name VARCHAR(255),
+        sender_photo TEXT
       );
     `);
   } catch (err) {
@@ -352,14 +374,14 @@ app.patch('/api/employees/:employeeId/leave-balances', async (req, res) => {
   }
 });
 
-// ...existing code...
 // Routes
 app.post('/api/login', async (req, res) => {
-  const { email, password } = req.body;
+  const { email, employeeId, password } = req.body;
+  const loginId = email || employeeId;
   try {
     const result = await pool.query(
       `SELECT * FROM employees WHERE (email = $1 OR employee_id = $1) AND password = $2 AND status = 'Active'`,
-      [email, password]
+      [loginId, password]
     );
     if (result.rows.length > 0) {
       const user = result.rows[0];
@@ -394,10 +416,11 @@ app.post('/api/employees', async (req, res) => {
       return res.status(400).json({ error: 'Designation is required' });
     }
 
+    // Set el_balance to 18 for every new user
     const result = await pool.query(
       `INSERT INTO employees
-      (employee_id, full_name, email, mobile_number, designation, role, joining_date, current_posting, password, status)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+      (employee_id, full_name, email, mobile_number, designation, role, joining_date, current_posting, password, status, el_balance)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, 18) RETURNING *`,
       [employee_id, full_name, email, mobile_number, designation, role, joining_date, current_posting, password, status]
     );
     res.json(result.rows[0]);
@@ -451,10 +474,17 @@ app.post('/api/leaves', async (req, res) => {
       'INSERT INTO leaves (employee_id, employee_name, type, start_date, end_date, days, reason, status, applied_on, location, designation) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *',
       [employeeId, employeeName, type, startDate, endDate, days, reason, 'Pending', new Date(), location, designation]
     );
-    // Add notification for admin
+    // Add notification for admin with sender information
     await pool.query(
-      'INSERT INTO notifications (type, message, user_id) VALUES ($1, $2, NULL)',
-      ['New Leave Request', `New leave request from ${employeeName} (${employeeId}) for ${type} from ${startDate} to ${endDate}.`,]
+      `INSERT INTO notifications (type, message, user_id, sender_id, sender_name, created_at, sender_photo) 
+       VALUES ($1, $2, NULL, $3, $4, CURRENT_TIMESTAMP, $5)`,
+      [
+        'New Leave Request', 
+        `New leave request from ${employeeName} (${employeeId}) for ${type} from ${startDate} to ${endDate}.`,
+        employeeId,
+        employeeName + ' [' + (req.headers['x-source'] === 'app' ? 'App' : 'Web') + ']',
+        (await pool.query('SELECT profile_photo FROM employees WHERE employee_id = $1', [employeeId])).rows[0]?.profile_photo || null
+      ]
     );
     res.json(result.rows[0]);
   } catch (err) {
@@ -468,7 +498,7 @@ app.get('/api/leaves', async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT 
-        l.*,
+        l.*, 
         COALESCE(l.designation, e.designation) as designation,
         e.designation as employee_designation
       FROM leaves l 
@@ -476,10 +506,27 @@ app.get('/api/leaves', async (req, res) => {
       ORDER BY l.applied_on DESC
     `);
 
-    const transformedData = result.rows.map(row => ({
-      ...row,
-      designation: row.designation || row.employee_designation || 'Not Specified'
-    }));
+    // Map all possible cancellation fields for admin panel visibility
+    const transformedData = result.rows.map(row => {
+      return {
+        id: row.id,
+        employeeId: row.employee_id,
+        employeeName: row.employee_name,
+        type: row.type,
+        startDate: row.start_date,
+        endDate: row.end_date,
+        days: row.days,
+        reason: row.reason,
+        status: row.status,
+        appliedOn: row.applied_on,
+        location: row.location,
+        remarks: row.remarks,
+        designation: row.designation || row.employee_designation || 'Not Specified',
+        cancelRequestStatus: row.cancel_request_status,
+        cancelReason: row.cancel_reason,
+        documentPath: row.document_path
+      };
+    });
 
     res.json(transformedData);
   } catch (err) {
@@ -488,9 +535,10 @@ app.get('/api/leaves', async (req, res) => {
   }
 });
 
-// Get leave requests for specific employee
+// Get leave requests for specific employee (improved mapping, deduplication, filtering)
 app.get('/api/leaves/:employeeId', async (req, res) => {
   try {
+    const { status } = req.query;
     const result = await pool.query(
       `SELECT 
         l.*,
@@ -501,133 +549,142 @@ app.get('/api/leaves/:employeeId', async (req, res) => {
       ORDER BY l.applied_on DESC`,
       [req.params.employeeId]
     );
-    res.json(result.rows);
+    let leaves = result.rows;
+    // Optional status filter
+    if (status) {
+      leaves = leaves.filter(l => (l.status || '').toLowerCase() === status.toLowerCase());
+    }
+    // Deduplicate by id, keep latest
+    const uniqueLeaves = {};
+    for (const leave of leaves) {
+      if (!uniqueLeaves[leave.id] || new Date(leave.applied_on) > new Date(uniqueLeaves[leave.id].applied_on)) {
+        uniqueLeaves[leave.id] = leave;
+      }
+    }
+    // Map to consistent frontend format and include can_request_cancellation
+    const mapped = Object.values(uniqueLeaves).map(leave => {
+      return {
+        id: leave.id,
+        leaveType: leave.type || leave.leave_type || leave.leave_type_id || '',
+        startDate: leave.start_date || leave.startDate || '',
+        endDate: leave.end_date || leave.endDate || '',
+        days: leave.days || leave.no_of_days || '',
+        status: leave.status || '',
+        reason: leave.reason || '',
+        appliedDate: leave.applied_on || leave.appliedDate || leave.created_at || '',
+        approvedBy: leave.approved_by || leave.approvedBy || '',
+        icon: '', // let frontend guess icon
+        designation: leave.designation || '',
+        remarks: leave.remarks || '',
+        approvedDate: leave.approved_date || '',
+        rejectedDate: leave.rejected_date || '',
+        cancelledDate: leave.cancelled_date || '',
+        location: leave.location || '',
+      };
+    });
+    // Sort by appliedDate DESC
+    mapped.sort((a, b) => new Date(b.appliedDate) - new Date(a.appliedDate));
+    res.json(mapped);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
 // Approve leave request
+// Approve leave request (robust, single implementation)
 app.patch('/api/leaves/:id/approve', async (req, res) => {
   const client = await pool.connect();
   try {
-    console.log('Starting leave approval process for ID:', req.params.id);
     await client.query('BEGIN');
-
-    // Get the leave request details
-    console.log('Fetching leave request details...');
+    // Get leave details
     const leaveResult = await client.query(
-      'SELECT l.*, e.designation as employee_designation FROM leaves l LEFT JOIN employees e ON l.employee_id = e.employee_id WHERE l.id::text = $1',
+      `SELECT l.*, e.designation 
+       FROM leaves l
+       JOIN employees e ON l.employee_id = e.employee_id
+       WHERE l.id = $1 FOR UPDATE`,
       [req.params.id]
     );
-    console.log('Leave request result:', leaveResult.rows[0]);
-
     if (leaveResult.rows.length === 0) {
-      console.log('Leave request not found');
       await client.query('ROLLBACK');
-      return res.status(404).json({ success: false, message: 'Leave request not found' });
+      return res.status(404).json({ error: 'Leave not found' });
     }
-
     const leave = leaveResult.rows[0];
-    console.log('Leave details:', leave);
-
-    // Check if leave is already approved
-    if (leave.status === 'Approved') {
-      console.log('Leave already approved');
+    // Robust status check (case-insensitive)
+    if (typeof leave.status === 'string' && leave.status.trim().toLowerCase() === 'approved') {
       await client.query('ROLLBACK');
-      return res.status(400).json({ success: false, message: 'Leave request is already approved' });
+      return res.status(400).json({ error: 'Leave already approved' });
     }
-
-    // Get employee details
-    console.log('Fetching employee details for ID:', leave.employee_id);
+    // Check leave balance
+    const balanceColumn = {
+      'CL': 'cl_balance',
+      'EL': 'el_balance',
+      'RH': 'rh_balance'
+    }[leave.type];
+    if (!balanceColumn) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Invalid leave type' });
+    }
     const employeeResult = await client.query(
-      'SELECT * FROM employees WHERE employee_id = $1',
+      `SELECT ${balanceColumn} FROM employees 
+       WHERE employee_id = $1 FOR UPDATE`,
       [leave.employee_id]
     );
-    console.log('Employee result:', employeeResult.rows[0]);
-
     if (employeeResult.rows.length === 0) {
-      console.log('Employee not found');
       await client.query('ROLLBACK');
-      return res.status(404).json({ success: false, message: 'Employee not found' });
+      return res.status(404).json({ error: 'Employee not found' });
     }
-
-    const employee = employeeResult.rows[0];
-
-    // Check leave balance
-    let balanceColumn;
-    let currentBalance;
-    switch (leave.type) {
-      case 'CL':
-        balanceColumn = 'cl_balance';
-        currentBalance = employee.cl_balance || 0;
-        break;
-      case 'RH':
-        balanceColumn = 'rh_balance';
-        currentBalance = employee.rh_balance || 0;
-        break;
-      case 'EL':
-        balanceColumn = 'el_balance';
-        currentBalance = employee.el_balance || 0;
-        break;
-      default:
-        console.log('Invalid leave type:', leave.type);
-        await client.query('ROLLBACK');
-        return res.status(400).json({ success: false, message: 'Invalid leave type' });
-    }
-
-    console.log('Leave balance check:', {
-      type: leave.type,
-      balanceColumn,
-      currentBalance,
-      requestedDays: leave.days
-    });
-
+    const currentBalance = employeeResult.rows[0][balanceColumn];
     if (currentBalance < leave.days) {
-      console.log('Insufficient balance');
       await client.query('ROLLBACK');
       return res.status(400).json({ 
-        success: false, 
-        message: `Insufficient leave balance. Current balance: ${currentBalance}, Requested: ${leave.days}` 
+        error: `Insufficient ${leave.type} balance` 
       });
     }
-
     // Update leave status
-    console.log('Updating leave status to Approved');
     const updateResult = await client.query(
-      'UPDATE leaves SET status = $1, approved_date = $2 WHERE id::text = $3 RETURNING *',
-      ['Approved', new Date(), req.params.id]
+      `UPDATE leaves 
+       SET status = 'Approved', approved_date = NOW() 
+       WHERE id = $1 RETURNING *`,
+      [req.params.id]
     );
-
-    // Deduct leave days from balance
-    console.log('Deducting leave balance:', {
-      balanceColumn,
-      daysToDeduct: leave.days,
-      employeeId: leave.employee_id
-    });
-    
-    const updateBalanceQuery = `UPDATE employees SET ${balanceColumn} = ${balanceColumn} - $1 WHERE employee_id = $2`;
-    console.log('Update balance query:', updateBalanceQuery);
-    
+    // Deduct leave balance
     await client.query(
-      updateBalanceQuery,
+      `UPDATE employees 
+       SET ${balanceColumn} = ${balanceColumn} - $1 
+       WHERE employee_id = $2`,
       [leave.days, leave.employee_id]
     );
-
-    console.log('Committing transaction...');
+    
+    // Notify employee about approval (set sender_name and sender_photo to employee info, append [App]/[Web] based on x-source)
+    const empInfo = await client.query('SELECT full_name, profile_photo FROM employees WHERE employee_id = $1', [leave.employee_id]);
+    let empName = empInfo.rows[0]?.full_name || 'Employee';
+    const empPhoto = empInfo.rows[0]?.profile_photo || null;
+    const source = req.headers['x-source'] === 'app' ? 'App' : 'Web';
+    if (!/\[(App|Web)\]$/.test(empName)) {
+      empName = empName + ` [${source}]`;
+    }
+    await client.query(
+      `INSERT INTO notifications (type, message, user_id, sender_id, sender_name, sender_photo, created_at) 
+       VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)`,
+      [
+        'leave_approved',
+        `Your ${leave.type} leave request from ${leave.start_date} to ${leave.end_date} has been approved.`,
+        leave.employee_id,
+        leave.employee_id,
+        empName,
+        empPhoto
+      ]
+    );
+    
     await client.query('COMMIT');
-    console.log('Leave approval successful');
     res.json({ success: true, leave: updateResult.rows[0] });
   } catch (err) {
-    console.error('Error in approve leave:', err);
-    console.error('Error details:', {
-      message: err.message,
-      stack: err.stack,
-      code: err.code,
-      detail: err.detail
-    });
     await client.query('ROLLBACK');
-    res.status(500).json({ success: false, message: err.message });
+    res.status(500).json({ 
+      error: err.message || 'Failed to approve leave',
+      details: err.detail || null,
+      stack: err.stack || null
+    });
   } finally {
     client.release();
   }
@@ -638,13 +695,36 @@ app.patch('/api/leaves/:id/reject', async (req, res) => {
   try {
     const { remarks } = req.body;
     const result = await pool.query(
-      'UPDATE leaves SET status = $1, remarks = $2, rejected_date = $3 WHERE id::text = $4 RETURNING *',
-      ['Rejected', remarks, new Date(), req.params.id]
+      'UPDATE leaves SET status = $1, remarks = $2, rejected_date = NOW() WHERE id::text = $3 RETURNING *',
+      ['Rejected', remarks, req.params.id]
     );
 
     if (result.rows.length === 0) {
       return res.status(404).json({ success: false, message: 'Leave request not found' });
     }
+
+    const leave = result.rows[0];
+    
+    // Notify employee about rejection (set sender_name and sender_photo to employee info, append [App]/[Web] based on x-source)
+    const empInfo = await pool.query('SELECT full_name, profile_photo FROM employees WHERE employee_id = $1', [leave.employee_id]);
+    let empName = empInfo.rows[0]?.full_name || 'Employee';
+    const empPhoto = empInfo.rows[0]?.profile_photo || null;
+    const source = req.headers['x-source'] === 'app' ? 'App' : 'Web';
+    if (!/\[(App|Web)\]$/.test(empName)) {
+      empName = empName + ` [${source}]`;
+    }
+    await pool.query(
+      `INSERT INTO notifications (type, message, user_id, sender_id, sender_name, sender_photo, created_at) 
+       VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)`,
+      [
+        'leave_rejected',
+        `Your ${leave.type} leave request from ${leave.start_date} to ${leave.end_date} has been rejected. ${remarks ? `Reason: ${remarks}` : ''}`,
+        leave.employee_id,
+        leave.employee_id,
+        empName,
+        empPhoto
+      ]
+    );
 
     res.json({ success: true, leave: result.rows[0] });
   } catch (err) {
@@ -742,88 +822,174 @@ app.patch('/api/leaves/:id/cancel', async (req, res) => {
 });
 
 // Request leave cancellation (user side)
-app.patch('/api/leaves/:id/request-cancel', async (req, res) => {
+// Employee requests cancellation of an approved leave
+app.post('/api/leaves/:id/request-cancellation', async (req, res) => {
   try {
-    const { cancel_reason, user_id } = req.body;
-    const result = await pool.query(
-      'UPDATE leaves SET cancel_request_status = $1, cancel_reason = $2 WHERE id::text = $3 RETURNING *',
-      ['Requested', cancel_reason, req.params.id]
+    const leaveId = req.params.id;
+    const { employee_id, cancel_reason } = req.body;
+    // Check leave exists and is approved
+    const leaveResult = await pool.query(
+      'SELECT * FROM leaves WHERE id::text = $1 AND employee_id = $2',
+      [leaveId, employee_id]
     );
-    if (result.rows.length === 0) {
-      return res.status(404).json({ success: false, message: 'Leave request not found' });
+    if (leaveResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Leave not found' });
     }
-    // Insert a notification for admin (global notification, user_id = NULL)
+    const leave = leaveResult.rows[0];
+    if ((leave.status || '').toLowerCase() !== 'approved') {
+      return res.status(400).json({ error: 'Only approved leaves can be cancelled' });
+    }
+    if ((leave.cancel_request_status || '').toLowerCase() === 'pending') {
+      return res.status(400).json({ error: 'Cancellation already requested' });
+    }
+    // Mark leave as cancellation requested
     await pool.query(
-      'INSERT INTO notifications (type, message, user_id) VALUES ($1, $2, NULL)',
-      ['Leave Cancellation Request', `Leave ID ${req.params.id} requested cancellation.`]
+      `UPDATE leaves SET cancel_request_status = $1, cancel_reason = $2 WHERE id::text = $3`,
+      ['Pending', cancel_reason || '', leaveId]
     );
-    res.json({ success: true, leave: result.rows[0] });
+    // Notify admin/manager with sender information (set sender_name and sender_photo to employee info, append [App]/[Web] based on x-source)
+    const empInfo = await pool.query('SELECT full_name, profile_photo FROM employees WHERE employee_id = $1', [employee_id]);
+    let empName = empInfo.rows[0]?.full_name || 'Employee';
+    const empPhoto = empInfo.rows[0]?.profile_photo || null;
+    const source = req.headers['x-source'] === 'app' ? 'App' : 'Web';
+    if (!/\[(App|Web)\]$/.test(empName)) {
+      empName = empName + ` [${source}]`;
+    }
+    await pool.query(
+      `INSERT INTO notifications (type, message, user_id, sender_id, sender_name, sender_photo, created_at) 
+       VALUES ($1, $2, NULL, $3, $4, $5, CURRENT_TIMESTAMP)`,
+      [
+        'leave_cancellation_requested',
+        `Employee ${employee_id} requested cancellation for leave ${leaveId}`,
+        employee_id,
+        empName,
+        empPhoto
+      ]
+    );
+    res.json({ success: true, message: 'Cancellation request submitted' });
   } catch (err) {
-    console.error('Error in request-cancel:', err);
-    res.status(500).json({ success: false, message: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// Admin approves cancellation
-app.patch('/api/leaves/:id/approve-cancel', async (req, res) => {
+// Admin approves cancellation request
+app.post('/api/leaves/:id/approve-cancellation', async (req, res) => {
   try {
-    // Find the leave to get the user_id
-    const leaveResult = await pool.query('SELECT employee_id FROM leaves WHERE id::text = $1', [req.params.id]);
-    const userId = leaveResult.rows.length > 0 ? leaveResult.rows[0].employee_id : null;
-    const result = await pool.query(
-      'UPDATE leaves SET cancel_request_status = $1 WHERE id::text = $2 RETURNING *',
-      ['Approved', req.params.id]
-    );
-    if (result.rows.length === 0) {
-      return res.status(404).json({ success: false, message: 'Leave request not found' });
+    const leaveId = req.params.id;
+    // Find leave
+    const leaveResult = await pool.query('SELECT * FROM leaves WHERE id::text = $1', [leaveId]);
+    if (leaveResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Leave not found' });
     }
-    // Insert notification for user
-    if (userId) {
+    const leave = leaveResult.rows[0];
+    if ((leave.cancel_request_status || '').toLowerCase() !== 'pending') {
+      return res.status(400).json({ error: 'No pending cancellation request' });
+    }
+    // Set leave as cancelled
+    await pool.query(
+      `UPDATE leaves SET status = $1, cancel_request_status = $2, cancelled_date = CURRENT_TIMESTAMP WHERE id::text = $3`,
+      ['Cancelled', 'Approved', leaveId]
+    );
+    // Restore leave balance
+    let balanceColumn = '';
+    switch ((leave.type || '').toUpperCase()) {
+      case 'CL': balanceColumn = 'cl_balance'; break;
+      case 'EL': balanceColumn = 'el_balance'; break;
+      case 'RH': balanceColumn = 'rh_balance'; break;
+    }
+    if (balanceColumn) {
       await pool.query(
-        'INSERT INTO notifications (type, message, user_id) VALUES ($1, $2, $3)',
-        ['Leave Cancellation Approved', `Your leave cancellation for ID ${req.params.id} was approved.`, userId]
+        `UPDATE employees SET ${balanceColumn} = ${balanceColumn} + $1 WHERE employee_id = $2`,
+        [leave.days, leave.employee_id]
       );
     }
-    res.json({ success: true, leave: result.rows[0] });
+    // Notify employee with sender information (set sender_name and sender_photo to employee info, append [App]/[Web] based on x-source)
+    const empInfo = await pool.query('SELECT full_name, profile_photo FROM employees WHERE employee_id = $1', [leave.employee_id]);
+    let empName = empInfo.rows[0]?.full_name || 'Employee';
+    const empPhoto = empInfo.rows[0]?.profile_photo || null;
+    const source = req.headers['x-source'] === 'app' ? 'App' : 'Web';
+    if (!/\[(App|Web)\]$/.test(empName)) {
+      empName = empName + ` [${source}]`;
+    }
+    await pool.query(
+      `INSERT INTO notifications (type, message, user_id, sender_id, sender_name, sender_photo, created_at) 
+       VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)`,
+      [
+        'leave_cancellation_approved',
+        `Your leave cancellation for leave ${leaveId} was approved`,
+        leave.employee_id,
+        leave.employee_id,
+        empName,
+        empPhoto
+      ]
+    );
+    res.json({ success: true, message: 'Leave cancellation approved and leave cancelled' });
   } catch (err) {
-    console.error('Error in approve-cancel:', err);
-    res.status(500).json({ success: false, message: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// Admin rejects cancellation
-app.patch('/api/leaves/:id/reject-cancel', async (req, res) => {
+// Admin rejects cancellation request
+app.post('/api/leaves/:id/reject-cancellation', async (req, res) => {
   try {
-    const { reason } = req.body;
-    // Find the leave to get the user_id
-    const leaveResult = await pool.query('SELECT employee_id FROM leaves WHERE id::text = $1', [req.params.id]);
-    const userId = leaveResult.rows.length > 0 ? leaveResult.rows[0].employee_id : null;
-    const result = await pool.query(
-      'UPDATE leaves SET cancel_request_status = $1, cancel_reason = $2 WHERE id::text = $3 RETURNING *',
-      ['Rejected', reason || 'Rejected by admin', req.params.id]
+    const leaveId = req.params.id;
+    const { remarks } = req.body;
+    // Find leave
+    const leaveResult = await pool.query('SELECT * FROM leaves WHERE id::text = $1', [leaveId]);
+    if (leaveResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Leave not found' });
+    }
+    const leave = leaveResult.rows[0];
+    if ((leave.cancel_request_status || '').toLowerCase() !== 'pending') {
+      return res.status(400).json({ error: 'No pending cancellation request' });
+    }
+    // Revert cancellation request
+    await pool.query(
+      `UPDATE leaves SET cancel_request_status = $1, cancel_reason = $2 WHERE id::text = $3`,
+      ['Rejected', remarks || '', leaveId]
     );
-    if (result.rows.length === 0) {
-      return res.status(404).json({ success: false, message: 'Leave request not found' });
+    // Notify employee with sender information (set sender_name and sender_photo to employee info, append [App]/[Web] based on x-source)
+    const empInfo = await pool.query('SELECT full_name, profile_photo FROM employees WHERE employee_id = $1', [leave.employee_id]);
+    let empName = empInfo.rows[0]?.full_name || 'Employee';
+    const empPhoto = empInfo.rows[0]?.profile_photo || null;
+    const source = req.headers['x-source'] === 'app' ? 'App' : 'Web';
+    if (!/\[(App|Web)\]$/.test(empName)) {
+      empName = empName + ` [${source}]`;
     }
-    // Insert notification for user
-    if (userId) {
-      await pool.query(
-        'INSERT INTO notifications (type, message, user_id) VALUES ($1, $2, $3)',
-        ['Leave Cancellation Rejected', `Your leave cancellation for ID ${req.params.id} was rejected.`, userId]
-      );
-    }
-    res.json({ success: true, leave: result.rows[0] });
+    await pool.query(
+      `INSERT INTO notifications (type, message, user_id, sender_id, sender_name, sender_photo, created_at) 
+       VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)`,
+      [
+        'leave_cancellation_rejected',
+        `Your leave cancellation for leave ${leaveId} was rejected. ${remarks || ''}`,
+        leave.employee_id,
+        leave.employee_id,
+        empName,
+        empPhoto
+      ]
+    );
+    res.json({ success: true, message: 'Leave cancellation rejected' });
   } catch (err) {
-    console.error('Error in reject-cancel:', err);
-    res.status(500).json({ success: false, message: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
+
+
+
 
 // Get notifications for a specific user
 app.get('/api/notifications/:userId', async (req, res) => {
   try {
     const { userId } = req.params;
-    const result = await pool.query('SELECT * FROM notifications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50', [userId]);
+    const result = await pool.query(`
+      SELECT n.*, 
+             n.sender_name as sender_full_name,
+             n.sender_photo as sender_profile_photo
+      FROM notifications n
+      WHERE n.user_id = $1 
+      ORDER BY n.created_at DESC 
+      LIMIT 50
+    `, [userId]);
     res.json(result.rows);
   } catch (err) {
     console.error('Error fetching user notifications:', err);
@@ -834,7 +1000,15 @@ app.get('/api/notifications/:userId', async (req, res) => {
 // Get notifications for admin/global
 app.get('/api/notifications', async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM notifications WHERE user_id IS NULL ORDER BY created_at DESC LIMIT 50');
+    const result = await pool.query(`
+      SELECT n.*, 
+             n.sender_name as sender_full_name,
+             n.sender_photo as sender_profile_photo
+      FROM notifications n
+      WHERE n.user_id IS NULL 
+      ORDER BY n.created_at DESC 
+      LIMIT 50
+    `);
     res.json(result.rows);
   } catch (err) {
     console.error('Error fetching notifications:', err);
@@ -895,15 +1069,97 @@ app.post('/api/employees/upload_profile_photo', uploadProfilePhoto.single('photo
     if (!req.file) {
       return res.status(400).json({ error: 'No file uploaded' });
     }
-    // You can save the file path to DB here if needed
     const profilePhotoUrl = `/uploads/profile_photos/${req.file.filename}`;
+
+    // Get the old photo filename (if any)
+    const oldPhotoResult = await pool.query(
+      'SELECT profile_photo FROM employees WHERE employee_id = $1',
+      [employee_id]
+    );
+    if (oldPhotoResult.rows.length > 0 && oldPhotoResult.rows[0].profile_photo) {
+      const oldPhotoPath = oldPhotoResult.rows[0].profile_photo;
+      // Only delete if the old photo is not the same as the new one and is not null/empty
+      if (oldPhotoPath && oldPhotoPath !== profilePhotoUrl) {
+        const fullOldPath = path.join(__dirname, oldPhotoPath.replace(/^\//, ''));
+        // Only delete if file exists and is not used by any other user
+        try {
+          // Check if any other user is using this photo
+          const otherUserResult = await pool.query(
+            'SELECT COUNT(*) FROM employees WHERE profile_photo = $1 AND employee_id != $2',
+            [oldPhotoPath, employee_id]
+          );
+          if (parseInt(otherUserResult.rows[0].count) === 0 && fs.existsSync(fullOldPath)) {
+            fs.unlinkSync(fullOldPath);
+          }
+        } catch (e) {
+          console.error('Error deleting old profile photo:', e);
+        }
+      }
+    }
+
+    // Save the new photo URL to the database
+    await pool.query(
+      'UPDATE employees SET profile_photo = $1 WHERE employee_id = $2',
+      [profilePhotoUrl, employee_id]
+    );
+
     res.json({
       success: true,
-      message: 'Profile photo uploaded successfully',
+      message: 'Profile photo uploaded and saved successfully',
       url: profilePhotoUrl
     });
   } catch (err) {
     console.error('Error uploading profile photo:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PATCH profile photo for employee (for React admin panel)
+app.patch('/api/employees/:employeeId/profile-photo', uploadProfilePhoto.single('profile_photo'), async (req, res) => {
+  try {
+    const { employeeId } = req.params;
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+    const profilePhotoUrl = `/uploads/profile_photos/${req.file.filename}`;
+
+    // Get the old photo filename (if any)
+    const oldPhotoResult = await pool.query(
+      'SELECT profile_photo FROM employees WHERE employee_id = $1',
+      [employeeId]
+    );
+    if (oldPhotoResult.rows.length > 0 && oldPhotoResult.rows[0].profile_photo) {
+      const oldPhotoPath = oldPhotoResult.rows[0].profile_photo;
+      if (oldPhotoPath && oldPhotoPath !== profilePhotoUrl) {
+        const fullOldPath = path.join(__dirname, oldPhotoPath.replace(/^\//, ''));
+        try {
+          const otherUserResult = await pool.query(
+            'SELECT COUNT(*) FROM employees WHERE profile_photo = $1 AND employee_id != $2',
+            [oldPhotoPath, employeeId]
+          );
+          if (parseInt(otherUserResult.rows[0].count) === 0 && fs.existsSync(fullOldPath)) {
+            fs.unlinkSync(fullOldPath);
+          }
+        } catch (e) {
+          console.error('Error deleting old profile photo:', e);
+        }
+      }
+    }
+
+    // Save the new photo URL to the database
+    await pool.query(
+      'UPDATE employees SET profile_photo = $1 WHERE employee_id = $2',
+      [profilePhotoUrl, employeeId]
+    );
+
+    // Build absolute URL for frontend
+    const fullUrl = `${req.protocol}://${req.get('host')}${profilePhotoUrl}`;
+
+    res.json({
+      profile_photo: fullUrl
+    });
+  } catch (err) {
+    console.error('Error uploading profile photo (PATCH):', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -1184,26 +1440,22 @@ app.put('/api/employees/profile', async (req, res) => {
 });
 
 // Cancel approved leave request
+// Cancel approved leave request (clean, no duplicate status/cancellation fields)
 app.post('/api/leaves/cancel-approved', async (req, res) => {
   try {
     const { leave_id, employee_id, cancel_reason } = req.body;
-    
     if (!leave_id || !employee_id) {
       return res.status(400).json({ error: 'Leave ID and Employee ID are required' });
     }
 
-    // First check if the leave exists and is approved
+    // Check if the leave exists and is approved
     const leaveCheck = await pool.query(
       'SELECT * FROM leaves WHERE id::text = $1 AND employee_id = $2 AND status = $3',
       [leave_id, employee_id, 'Approved']
     );
-
     if (leaveCheck.rows.length === 0) {
-      return res.status(404).json({ 
-        error: 'Leave not found or not approved. Only approved leaves can be cancelled.' 
-      });
+      return res.status(404).json({ error: 'Leave not found or not approved. Only approved leaves can be cancelled.' });
     }
-
     const leave = leaveCheck.rows[0];
     const leaveStartDate = new Date(leave.start_date);
     const today = new Date();
@@ -1220,56 +1472,47 @@ app.post('/api/leaves/cancel-approved', async (req, res) => {
 
     // Check if leave has already started
     if (leaveStartDate <= today) {
-      return res.status(400).json({ 
-        error: 'Cannot cancel leave that has already started or passed' 
-      });
+      return res.status(400).json({ error: 'Cannot cancel leave that has already started or passed' });
     }
 
-    // Update leave status to cancelled
+    // Update leave status to cancelled (no extra status fields)
     const result = await pool.query(
       `UPDATE leaves 
        SET status = 'Cancelled', 
-           cancel_request_status = 'Cancelled',
-           cancel_reason = $1,
+           remarks = $1,
+           cancelled_date = CURRENT_TIMESTAMP,
            updated_at = CURRENT_TIMESTAMP
        WHERE id::text = $2 AND employee_id = $3 
        RETURNING *`,
       [cancel_reason || 'Cancelled by employee', leave_id, employee_id]
     );
-
     if (result.rows.length === 0) {
       return res.status(500).json({ error: 'Failed to cancel leave' });
     }
 
     // Restore leave balance
-    const leaveType = leave.leave_type ? leave.leave_type.toLowerCase() : (leave.type ? leave.type.toLowerCase() : '');
     let balanceColumn = '';
-    
-    if (leaveType.includes('casual')) {
-      balanceColumn = 'cl_balance';
-    } else if (leaveType.includes('earned')) {
-      balanceColumn = 'el_balance';
-    } else if (leaveType.includes('restricted')) {
-      balanceColumn = 'rh_balance';
+    switch ((leave.type || '').toUpperCase()) {
+      case 'CL': balanceColumn = 'cl_balance'; break;
+      case 'EL': balanceColumn = 'el_balance'; break;
+      case 'RH': balanceColumn = 'rh_balance'; break;
     }
-
     if (balanceColumn) {
       await pool.query(
-        `UPDATE employees 
-         SET ${balanceColumn} = ${balanceColumn} + $1 
-         WHERE employee_id = $2`,
-        [leave.duration || leave.days, employee_id]
+        `UPDATE employees SET ${balanceColumn} = ${balanceColumn} + $1 WHERE employee_id = $2`,
+        [leave.days, employee_id]
       );
     }
 
     // Create notification for manager
     await pool.query(
-      `INSERT INTO notifications (type, message, user_id, created_at) 
-       VALUES ($1, $2, $3, CURRENT_TIMESTAMP)`,
+      `INSERT INTO notifications (type, message, user_id, sender_id, created_at) 
+       VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)`,
       [
         'leave_cancelled',
         `Leave request ${leave_id} has been cancelled by employee ${employee_id}`,
-        leave.manager_id || 1 // Default manager ID if not set
+        leave.manager_id || 1,
+        employee_id
       ]
     );
 
@@ -1277,9 +1520,8 @@ app.post('/api/leaves/cancel-approved', async (req, res) => {
       success: true,
       message: 'Leave cancelled successfully',
       leave: result.rows[0],
-      balanceRestored: balanceColumn ? true : false
+      balanceRestored: !!balanceColumn
     });
-
   } catch (err) {
     console.error('Error cancelling approved leave:', err);
     res.status(500).json({ error: err.message });
@@ -1393,7 +1635,41 @@ app.delete('/api/notifications/:userId/clear', async (req, res) => {
   }
 });
 
+// Test endpoint to create notification with sender information
+app.post('/api/notifications/test', async (req, res) => {
+  try {
+    const { message, user_id, sender_id } = req.body;
+    
+    // Get sender information
+    let senderInfo = { full_name: 'System', profile_photo: null };
+    if (sender_id) {
+      const senderResult = await pool.query(
+        'SELECT full_name, profile_photo FROM employees WHERE employee_id = $1',
+        [sender_id]
+      );
+      if (senderResult.rows.length > 0) {
+        senderInfo = senderResult.rows[0];
+      }
+    }
+    
+    const result = await pool.query(
+      `INSERT INTO notifications (type, message, user_id, sender_id, created_at) 
+       VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP) 
+       RETURNING *`,
+      ['test', message, user_id, sender_id]
+    );
+    
+    res.json({
+      success: true,
+      notification: result.rows[0]
+    });
+  } catch (err) {
+    console.error('Error creating test notification:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Start server
 app.listen(port, () => {
   console.log(`Server is running on port ${port}`);
-}); 
+});
