@@ -20,9 +20,9 @@ app.get('/', (req, res) => {
 // PostgreSQL Connection
 const pool = new Pool({
   user: 'buidco_user',
-  host: 'dpg-d1gc1cvfte5s738f92rg-a',
-  database: 'buidco_leave',
-  password: 'JSC2DpXEZDlRDZwx4SS0rKuCQrEwNUTb',
+  host: 'dpg-d1ojnc2dbo4c73b5egcg-a',
+  database: 'buidco_leave_lfur',
+  password: 'f0hoXziTaxZhCd5RneXWG4UFul48WIZr',
   port: 5432,
   ssl: { rejectUnauthorized: false }
 });
