@@ -12,6 +12,11 @@ const port = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
+// Root route for health/status
+app.get('/', (req, res) => {
+  res.send('BLMS API is running');
+});
+
 // PostgreSQL Connection
 const pool = new Pool({
   user: 'buidco_user',
