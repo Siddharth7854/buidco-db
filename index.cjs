@@ -15,10 +15,10 @@ app.use(express.json());
 // PostgreSQL Connection
 const pool = new Pool({
   user: 'buidco_user',
-  host: 'dpg-d1gc1cvfte5s738f92rg-a.singapore-postgres.render.com',
+  host: 'dpg-d1gc1cvfte5s738f92rg-a',
   database: 'buidco_leave',
   password: 'JSC2DpXEZDlRDZwx4SS0rKuCQrEwNUTb',
-  port: 5423,
+  port: 5432,
   ssl: { rejectUnauthorized: false }
 });
 
