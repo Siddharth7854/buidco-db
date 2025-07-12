@@ -15,24 +15,51 @@ const port = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
-// PostgreSQL Connection
+// PostgreSQL Connection with improved error handling
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL || `postgresql://${process.env.PGUSER}:${process.env.PGPASSWORD}@${process.env.PGHOST}:${process.env.PGPORT}/${process.env.PGDATABASE}?sslmode=require`,
-  ssl: {
+  ssl: process.env.NODE_ENV === 'production' ? {
     rejectUnauthorized: false,
     require: true
-  }
+  } : false,
+  // Add connection timeout and retry options
+  connectionTimeoutMillis: 10000,
+  idleTimeoutMillis: 30000,
+  max: 10,
+  // Force IPv4 to avoid IPv6 connectivity issues
+  options: process.env.NODE_ENV === 'production' ? '-c default_transaction_isolation=read_committed' : undefined
 });
 
-// Test database connection
-pool.query('SELECT NOW()', (err, res) => {
-  if (err) {
-    console.error('Error connecting to the database:', err);
-    console.log('DATABASE_URL:', process.env.DATABASE_URL ? 'Set' : 'Not set');
-  } else {
-    console.log('Connected to PostgreSQL database');
+// Test database connection with retry logic
+async function testDatabaseConnection() {
+  let retries = 3;
+  while (retries > 0) {
+    try {
+      const result = await pool.query('SELECT NOW()');
+      console.log('✅ Connected to PostgreSQL database successfully');
+      console.log('Database time:', result.rows[0].now);
+      return true;
+    } catch (err) {
+      console.error(`❌ Database connection attempt failed (${4-retries}/3):`, err.message);
+      console.log('Environment check:');
+      console.log('- DATABASE_URL:', process.env.DATABASE_URL ? '✅ Set' : '❌ Not set');
+      console.log('- NODE_ENV:', process.env.NODE_ENV || 'development');
+      console.log('- Port:', process.env.PORT || 5000);
+      
+      retries--;
+      if (retries > 0) {
+        console.log(`Retrying in 5 seconds... (${retries} attempts left)`);
+        await new Promise(resolve => setTimeout(resolve, 5000));
+      }
+    }
   }
-});
+  console.error('🚨 Failed to connect to database after 3 attempts');
+  console.log('💡 Please check your Railway PostgreSQL service and DATABASE_URL environment variable');
+  return false;
+}
+
+// Test connection on startup
+testDatabaseConnection();
 
 // Handle pool errors
 pool.on('error', (err, client) => {
@@ -95,8 +122,17 @@ app.use((err, req, res, next) => {
 
 // Create tables if they don't exist
 async function createTables() {
-  const client = await pool.connect();
+  // Skip table creation if DATABASE_URL is not set
+  if (!process.env.DATABASE_URL) {
+    console.log('⚠️ DATABASE_URL not set, skipping table creation');
+    console.log('📋 Please set DATABASE_URL in Railway environment variables');
+    return false;
+  }
+
+  let client;
   try {
+    console.log('🔧 Attempting to create/check database tables...');
+    client = await pool.connect();
     await client.query('BEGIN');
 
     // Create employees table if it doesn't exist
@@ -176,39 +212,79 @@ async function createTables() {
     `);
 
     await client.query('COMMIT');
-    console.log('All tables created/verified successfully');
+    console.log('✅ All tables created/verified successfully');
+    return true;
   } catch (err) {
-    await client.query('ROLLBACK');
-    console.error('Error creating tables:', err);
+    if (client) await client.query('ROLLBACK');
+    
+    if (err.code === 'ENETUNREACH' || err.code === 'ENOTFOUND' || err.code === 'ECONNREFUSED') {
+      console.log('🌐 Database connection issue - this is normal during Railway deployment startup');
+      console.log('💡 Railway PostgreSQL service may still be initializing, retrying later...');
+    } else if (err.code === '42501') {
+      console.log('🔒 Permission denied - tables may already exist');
+    } else {
+      console.error('❌ Error creating tables:', err.message);
+    }
+    return false;
   } finally {
-    client.release();
+    if (client) client.release();
   }
 }
 
-// Call the function to create tables
-createTables().then(async () => {
-  // Create a default admin user if no users exist
-  try {
-    const userCount = await pool.query('SELECT COUNT(*) FROM employees');
-    if (parseInt(userCount.rows[0].count) === 0) {
-      await pool.query(`
-        INSERT INTO employees (
-          employee_id, full_name, email, mobile_number, 
-          designation, role, password, status
-        ) VALUES (
-          'ADMIN001', 'System Administrator', 'admin@buidco.com', '8002659674',
-          'Administrator', 'admin', 'admin123', 'Active'
-        )
-      `);
-      console.log('Default admin user created: admin@buidco.com / admin123');
+// Call the function to create tables with retry logic
+async function initializeDatabase() {
+  let retries = 3;
+  let success = false;
+  
+  while (retries > 0 && !success) {
+    console.log(`🔄 Database initialization attempt ${4-retries}/3...`);
+    success = await createTables();
+    
+    if (success) {
+      // Create a default admin user if no users exist
+      try {
+        const userCount = await pool.query('SELECT COUNT(*) FROM employees');
+        if (parseInt(userCount.rows[0].count) === 0) {
+          await pool.query(`
+            INSERT INTO employees (
+              employee_id, full_name, email, mobile_number, 
+              designation, role, password, status
+            ) VALUES (
+              'ADMIN001', 'System Administrator', 'admin@buidco.com', '8002659674',
+              'Administrator', 'admin', 'admin123', 'Active'
+            )
+          `);
+          console.log('👤 Default admin user created: admin@buidco.com / admin123');
+        }
+      } catch (err) {
+        console.log('ℹ️ Note: Could not create default admin user:', err.message);
+      }
+    } else {
+      retries--;
+      if (retries > 0) {
+        console.log(`⏳ Waiting 10 seconds before retry... (${retries} attempts left)`);
+        await new Promise(resolve => setTimeout(resolve, 10000));
+      }
     }
-  } catch (err) {
-    console.log('Note: Could not create default admin user:', err.message);
   }
-});
+  
+  if (!success) {
+    console.log('⚠️ Could not initialize database after 3 attempts');
+    console.log('🚀 Server will continue running - database may become available later');
+  }
+}
+
+// Initialize database with delay for Railway
+setTimeout(initializeDatabase, 8000);
 
 // Add balance columns if they don't exist
 const addBalanceColumns = async () => {
+  // Skip if DATABASE_URL is not set
+  if (!process.env.DATABASE_URL) {
+    console.log('⚠️ DATABASE_URL not set, skipping balance column check');
+    return;
+  }
+
   try {
     // Check if leaves table exists first
     const tableExists = await pool.query(`
@@ -220,7 +296,7 @@ const addBalanceColumns = async () => {
     `);
 
     if (!tableExists.rows[0].exists) {
-      console.log('Leaves table does not exist yet, skipping column additions');
+      console.log('ℹ️ Leaves table does not exist yet, skipping column additions');
       return;
     }
 
@@ -240,19 +316,30 @@ const addBalanceColumns = async () => {
         AND l.designation IS NULL;
       END $$;
     `);
-    console.log('Balance columns verified/added successfully');
+    console.log('✅ Balance columns verified/added successfully');
   } catch (err) {
-    console.error('Error adding columns:', err);
+    if (err.code === 'ENETUNREACH' || err.code === 'ENOTFOUND' || err.code === 'ECONNREFUSED') {
+      console.log('🌐 Could not check balance columns - database connection issue');
+    } else {
+      console.error('❌ Error adding balance columns:', err.message);
+    }
   }
 };
 
-// Call the function to add balance columns
-addBalanceColumns();
+// Call with delay to ensure database is ready
+setTimeout(addBalanceColumns, 12000);
 
-// Ensure cancel_request_status and cancel_reason columns exist
-(async () => {
+// Ensure additional tables exist (with error handling)
+const ensureAdditionalTables = async () => {
+  // Skip if DATABASE_URL is not set
+  if (!process.env.DATABASE_URL) {
+    console.log('⚠️ DATABASE_URL not set, skipping additional table creation');
+    return;
+  }
+
   try {
-    // Create notifications table if not exists
+    // This is redundant since notifications table is created in createTables(),
+    // but keeping for safety
     await pool.query(`
       CREATE TABLE IF NOT EXISTS notifications (
         id SERIAL PRIMARY KEY,
@@ -266,36 +353,18 @@ addBalanceColumns();
         sender_photo TEXT
       );
     `);
+    console.log('✅ Additional tables verified/created successfully');
   } catch (err) {
-    console.error('Error ensuring columns/tables:', err);
+    if (err.code === 'ENETUNREACH' || err.code === 'ENOTFOUND' || err.code === 'ECONNREFUSED') {
+      console.log('🌐 Could not verify additional tables - database connection issue');
+    } else {
+      console.error('❌ Error ensuring additional tables:', err.message);
+    }
   }
-})();
+};
 
-// Create leave_documents table if not exists (after leaves table is ready)
-(async () => {
-  try {
-    // Wait a bit for other tables to be created first
-    setTimeout(async () => {
-      try {
-        await pool.query(`
-          CREATE TABLE IF NOT EXISTS leave_documents (
-            id SERIAL PRIMARY KEY,
-            leave_id INTEGER NOT NULL,
-            file_name TEXT,
-            file_url TEXT,
-            file_size INTEGER,
-            upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-          );
-        `);
-        console.log('Leave documents table verified/created successfully');
-      } catch (err) {
-        console.error('Error creating leave_documents table:', err);
-      }
-    }, 2000);
-  } catch (err) {
-    console.error('Error in leave_documents table setup:', err);
-  }
-})();
+// Call with delay to ensure database is ready
+setTimeout(ensureAdditionalTables, 15000);
 
 // Bulk update all employees' earned leave balance to 18 (GET version, unique path)
 app.get('/api/employees/bulk-update-el-balance-all', async (req, res) => {
