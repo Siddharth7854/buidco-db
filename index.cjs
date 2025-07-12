@@ -11,26 +11,55 @@ require('dotenv').config();
 const app = express();
 const port = process.env.PORT || 5000;
 
-// Middleware
+// Middleware - Enhanced CORS for frontend connectivity
 app.use(cors({
-  origin: ['http://localhost:8080', 'http://localhost:3000', 'http://127.0.0.1:8080', 'http://127.0.0.1:3000'],
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    
+    const allowedOrigins = [
+      'http://localhost:8080',
+      'http://localhost:3000', 
+      'http://localhost:5173',
+      'http://127.0.0.1:8080',
+      'http://127.0.0.1:3000',
+      'http://127.0.0.1:5173'
+    ];
+    
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    
+    // For production, also allow requests without specific origin
+    return callback(null, true);
+  },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-source', 'Accept']
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-source', 'Accept', 'Origin', 'X-Requested-With'],
+  optionsSuccessStatus: 200
 }));
 
-// Add additional CORS handling for preflight
+// Add comprehensive CORS handling
 app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
-  res.header('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,PATCH,OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-source, Accept');
-  res.header('Access-Control-Allow-Credentials', 'true');
+  const origin = req.headers.origin;
   
-  if (req.method === 'OPTIONS') {
-    res.sendStatus(200);
+  if (origin) {
+    res.header('Access-Control-Allow-Origin', origin);
   } else {
-    next();
+    res.header('Access-Control-Allow-Origin', '*');
   }
+  
+  res.header('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,PATCH,OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-source, Accept, Origin, X-Requested-With');
+  res.header('Access-Control-Allow-Credentials', 'true');
+  res.header('Access-Control-Max-Age', '86400'); // 24 hours
+  
+  // Handle preflight requests
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
+  
+  next();
 });
 
 app.use(express.json());
@@ -189,13 +218,20 @@ async function createTables() {
         password VARCHAR(255) NOT NULL,
         status VARCHAR(20) DEFAULT 'Active',
         profile_photo TEXT,
-        cl_balance INTEGER DEFAULT 10,
+        cl_balance INTEGER DEFAULT 16,
         rh_balance INTEGER DEFAULT 3,
         el_balance INTEGER DEFAULT 18,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
+
+    // Update existing employees CL balance from 10 to 16
+    await client.query(`
+      UPDATE employees SET cl_balance = 16 WHERE cl_balance = 10
+    `);
+
+    console.log('✅ Updated existing employees CL balance from 10 to 16');
 
     // Create leaves table if it doesn't exist
     await client.query(`
@@ -628,15 +664,57 @@ app.post('/api/employees', async (req, res) => {
 // Get all employees
 app.get('/api/employees', async (req, res) => {
   try {
+    console.log('📋 GET /api/employees called from origin:', req.headers.origin || 'no-origin');
+    
     const { employee_id } = req.query;
     if (employee_id) {
+      console.log('🔍 Fetching specific employee:', employee_id);
       const result = await pool.query('SELECT * FROM employees WHERE employee_id = $1', [employee_id]);
+      console.log('✅ Found employee:', result.rows.length > 0 ? 'Yes' : 'No');
       return res.json(result.rows);
     }
-    const result = await pool.query('SELECT * FROM employees');
+    
+    console.log('📋 Fetching all employees...');
+    const result = await pool.query(`
+      SELECT 
+        ROW_NUMBER() OVER (ORDER BY employee_id) as id,
+        employee_id, 
+        full_name, 
+        email, 
+        mobile_number, 
+        designation, 
+        role, 
+        joining_date, 
+        current_posting, 
+        status, 
+        profile_photo,
+        cl_balance, 
+        rh_balance, 
+        el_balance,
+        created_at,
+        updated_at
+      FROM employees 
+      ORDER BY employee_id
+    `);
+    
+    console.log(`✅ Found ${result.rows.length} employees`);
+    console.log('📊 Employee data sample:', result.rows.length > 0 ? {
+      id: result.rows[0].id,
+      employee_id: result.rows[0].employee_id,
+      full_name: result.rows[0].full_name,
+      role: result.rows[0].role
+    } : 'No employees found');
+    
+    // Set proper headers for JSON response
+    res.setHeader('Content-Type', 'application/json');
     res.json(result.rows);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('❌ Error in GET /api/employees:', err);
+    res.status(500).json({ 
+      error: err.message,
+      endpoint: '/api/employees',
+      timestamp: new Date().toISOString()
+    });
   }
 });
 
@@ -1310,6 +1388,59 @@ app.post('/api/employees/upload_profile_photo', uploadProfilePhoto.single('photo
   }
 });
 
+// Delete profile photo
+app.delete('/api/employees/:employeeId/profile-photo', async (req, res) => {
+  try {
+    const { employeeId } = req.params;
+
+    // Get the current photo path
+    const photoResult = await pool.query(
+      'SELECT profile_photo FROM employees WHERE employee_id = $1',
+      [employeeId]
+    );
+
+    if (photoResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Employee not found' });
+    }
+
+    const currentPhotoPath = photoResult.rows[0].profile_photo;
+
+    // Remove photo from database
+    await pool.query(
+      'UPDATE employees SET profile_photo = NULL WHERE employee_id = $1',
+      [employeeId]
+    );
+
+    // Delete physical file if it exists and no other user is using it
+    if (currentPhotoPath) {
+      try {
+        // Check if any other user is using this photo
+        const otherUserResult = await pool.query(
+          'SELECT COUNT(*) FROM employees WHERE profile_photo = $1',
+          [currentPhotoPath]
+        );
+        
+        if (parseInt(otherUserResult.rows[0].count) === 0) {
+          const fullPhotoPath = path.join(__dirname, currentPhotoPath.replace(/^\//, ''));
+          if (fs.existsSync(fullPhotoPath)) {
+            fs.unlinkSync(fullPhotoPath);
+          }
+        }
+      } catch (e) {
+        console.error('Error deleting profile photo file:', e);
+      }
+    }
+
+    res.json({
+      success: true,
+      message: 'Profile photo removed successfully'
+    });
+  } catch (err) {
+    console.error('Error removing profile photo:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // PATCH profile photo for employee (for React admin panel)
 app.patch('/api/employees/:employeeId/profile-photo', uploadProfilePhoto.single('profile_photo'), async (req, res) => {
   try {
@@ -1500,7 +1631,7 @@ app.get('/api/company/policies', async (req, res) => {
     res.json({
       casualLeave: {
         name: 'Casual Leave (CL)',
-        daysPerYear: 10,
+        daysPerYear: 16,
         description: 'For personal and family matters',
         approvalRequired: true,
         advanceNotice: '3 days'
