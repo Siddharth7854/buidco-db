@@ -460,6 +460,24 @@ app.get('/api/employees/bulk-update-el-balance-all', async (req, res) => {
   }
 });
 
+// Bulk update all employees' casual leave balance to 16 (GET version, unique path)
+app.get('/api/employees/bulk-update-cl-balance-all', async (req, res) => {
+  console.log('Bulk update CL balance endpoint hit');
+  try {
+    const result = await pool.query(
+      'UPDATE employees SET cl_balance = 16 WHERE cl_balance != 16 OR cl_balance IS NULL RETURNING employee_id, cl_balance'
+    );
+    res.json({ 
+      success: true, 
+      message: `Updated ${result.rows.length} employees' casual leave balance to 16`,
+      updatedEmployees: result.rows
+    });
+  } catch (err) {
+    console.error('Error bulk updating casual leave balance:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Delete employee by employee_id
 app.delete('/api/employees/:employeeId', async (req, res) => {
   try {
@@ -648,11 +666,11 @@ app.post('/api/employees', async (req, res) => {
       return res.status(400).json({ error: 'Designation is required' });
     }
 
-    // Set el_balance to 18 for every new user
+    // Set default balances: CL=16, RH=3, EL=18 for every new user
     const result = await pool.query(
       `INSERT INTO employees
-      (employee_id, full_name, email, mobile_number, designation, role, joining_date, current_posting, password, status, el_balance)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, 18) RETURNING *`,
+      (employee_id, full_name, email, mobile_number, designation, role, joining_date, current_posting, password, status, cl_balance, rh_balance, el_balance)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, 16, 3, 18) RETURNING *`,
       [employee_id, full_name, email, mobile_number, designation, role, joining_date, current_posting, password, status]
     );
     res.json(result.rows[0]);
