@@ -15,6 +15,24 @@ const port = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
+// Root route - API Status
+app.get('/', (req, res) => {
+  res.json({
+    success: true,
+    message: 'BUIDCO Employee Management System API',
+    status: 'Server is running successfully! 🚀',
+    version: '1.0.0',
+    endpoints: {
+      login: '/api/login',
+      employees: '/api/employees',
+      leaves: '/api/leaves',
+      notifications: '/api/notifications'
+    },
+    database: process.env.DATABASE_URL ? 'Connected' : 'Not configured',
+    timestamp: new Date().toISOString()
+  });
+});
+
 // PostgreSQL Connection with improved error handling for Render
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL || `postgresql://${process.env.PGUSER}:${process.env.PGPASSWORD}@${process.env.PGHOST}:${process.env.PGPORT}/${process.env.PGDATABASE}?sslmode=require`,
