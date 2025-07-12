@@ -14,16 +14,46 @@
 3. **Environment Variables**: Added dotenv support
 4. **Dependencies**: Fixed package-lock.json conflicts
 
+## 🚨 CRITICAL: You Need to Set DATABASE_URL in Railway!
+
+**Your deployment is working, but DATABASE_URL is missing!**
+
+### 📋 Step-by-Step Fix:
+
+1. **Go to Railway Dashboard**: https://railway.app
+2. **Find Your Deployed App** (should be named something like `buidco-db`)
+3. **Click on your app service** (not any database service)
+4. **Click "Variables" tab**
+5. **Click "New Variable"**
+6. **Add this EXACT variable**:
+   ```
+   Name: DATABASE_URL
+   Value: postgresql://buidco_user:f0hoXziTaxZhCd5RneXWG4UFul48WIZr@dpg-d1ojnc2dbo4c73b5egcg-a.singapore-postgres.render.com/buidco_leave_lfur
+   ```
+7. **Click "Save"**
+8. **Railway will automatically redeploy**
+
+### ✅ After Setting DATABASE_URL, You Should See:
+```
+✅ Connected to PostgreSQL database successfully
+🔧 Attempting to create/check database tables...
+✅ All tables created/verified successfully
+👤 Default admin user created: admin@buidco.com / admin123
+Server is running on port 8080
+```
+
 ## 🎯 YOUR SPECIFIC DATABASE CONFIGURATION
 
 **You already have a Render PostgreSQL database! Here's your setup:**
 
 ### Database URL (CONFIRMED ✅):
+
 ```
 postgresql://buidco_user:f0hoXziTaxZhCd5RneXWG4UFul48WIZr@dpg-d1ojnc2dbo4c73b5egcg-a.singapore-postgres.render.com/buidco_leave_lfur
 ```
 
 ### Set This in Railway Environment Variables:
+
 ```
 DATABASE_URL=postgresql://buidco_user:f0hoXziTaxZhCd5RneXWG4UFul48WIZr@dpg-d1ojnc2dbo4c73b5egcg-a.singapore-postgres.render.com/buidco_leave_lfur
 NODE_ENV=production
@@ -55,8 +85,9 @@ PGSSLMODE=require
 ## ✅ FINAL STATUS: READY FOR RAILWAY DEPLOYMENT!
 
 ### 🎯 Your Database is Connected and Working ✅
+
 - **Database**: Render PostgreSQL (Singapore region)
-- **Connection**: SSL enabled, tested successfully  
+- **Connection**: SSL enabled, tested successfully
 - **Tables**: Auto-created with proper schema
 - **Admin User**: Created (admin@buidco.com / admin123)
 
@@ -71,15 +102,17 @@ PGSSLMODE=require
 4. **Deploy**: Railway will automatically build and deploy
 
 ### 🔍 Expected Railway Logs (Success):
+
 ```
 ✅ Connected to PostgreSQL database successfully
 🔧 Attempting to create/check database tables...
-✅ All tables created/verified successfully  
+✅ All tables created/verified successfully
 👤 Default admin user created: admin@buidco.com / admin123
 Server is running on port XXXX
 ```
 
 ### 🌐 After Deployment:
+
 - Your backend will be live at: `https://your-app-name.railway.app`
 - Test endpoints: `/api/employees`, `/api/login`
 - Admin login: `admin@buidco.com` / `admin123`
