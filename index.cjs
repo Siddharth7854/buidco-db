@@ -17,8 +17,11 @@ app.use(express.json());
 
 // PostgreSQL Connection
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL || `postgresql://${process.env.PGUSER}:${process.env.PGPASSWORD}@${process.env.PGHOST}:${process.env.PGPORT}/${process.env.PGDATABASE}?sslmode=${process.env.PGSSLMODE}`,
-  ssl: process.env.NODE_ENV === 'production' || process.env.PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false
+  connectionString: process.env.DATABASE_URL || `postgresql://${process.env.PGUSER}:${process.env.PGPASSWORD}@${process.env.PGHOST}:${process.env.PGPORT}/${process.env.PGDATABASE}?sslmode=require`,
+  ssl: {
+    rejectUnauthorized: false,
+    require: true
+  }
 });
 
 // Test database connection
@@ -96,60 +99,131 @@ async function createTables() {
   try {
     await client.query('BEGIN');
 
-    // Check if tables exist first
-    const tablesExist = await client.query(`
-      SELECT EXISTS (
-        SELECT FROM information_schema.tables 
-        WHERE table_schema = 'public' 
-        AND table_name IN ('employees', 'leaves')
-      );
+    // Create employees table if it doesn't exist
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS employees (
+        employee_id VARCHAR(50) PRIMARY KEY,
+        full_name VARCHAR(255) NOT NULL,
+        email VARCHAR(255) UNIQUE NOT NULL,
+        mobile_number VARCHAR(20),
+        designation VARCHAR(255),
+        role VARCHAR(50) DEFAULT 'employee',
+        joining_date DATE,
+        current_posting VARCHAR(255),
+        password VARCHAR(255) NOT NULL,
+        status VARCHAR(20) DEFAULT 'Active',
+        profile_photo TEXT,
+        cl_balance INTEGER DEFAULT 10,
+        rh_balance INTEGER DEFAULT 3,
+        el_balance INTEGER DEFAULT 18,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
     `);
 
-    if (!tablesExist.rows[0].exists) {
-      console.log('Tables do not exist. Please create them manually with proper permissions.');
-      return;
-    }
-
-    // Check if columns exist in employees table
-    const columnsExist = await client.query(`
-      SELECT EXISTS (
-        SELECT FROM information_schema.columns 
-        WHERE table_schema = 'public' 
-        AND table_name = 'employees'
-        AND column_name IN ('cl_balance', 'rh_balance', 'el_balance')
-      );
+    // Create leaves table if it doesn't exist
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS leaves (
+        id SERIAL PRIMARY KEY,
+        employee_id VARCHAR(50) NOT NULL,
+        employee_name VARCHAR(255) NOT NULL,
+        type VARCHAR(10) NOT NULL CHECK (type IN ('CL', 'EL', 'RH', 'SL')),
+        start_date DATE NOT NULL,
+        end_date DATE NOT NULL,
+        days INTEGER NOT NULL,
+        reason TEXT,
+        status VARCHAR(20) DEFAULT 'Pending' CHECK (status IN ('Pending', 'Approved', 'Rejected', 'Cancelled')),
+        applied_on TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        approved_date TIMESTAMP,
+        rejected_date TIMESTAMP,
+        cancelled_date TIMESTAMP,
+        location VARCHAR(255),
+        remarks TEXT,
+        designation VARCHAR(255),
+        document_path TEXT,
+        cancel_request_status VARCHAR(20),
+        cancel_reason TEXT,
+        FOREIGN KEY (employee_id) REFERENCES employees(employee_id) ON DELETE CASCADE
+      )
     `);
 
-    if (!columnsExist.rows[0].exists) {
-      console.log('Adding leave balance columns to employees table...');
-      await client.query(`
-        ALTER TABLE employees 
-        ADD COLUMN IF NOT EXISTS cl_balance INTEGER DEFAULT 10,
-        ADD COLUMN IF NOT EXISTS rh_balance INTEGER DEFAULT 5,
-        ADD COLUMN IF NOT EXISTS el_balance INTEGER DEFAULT 18;
-      `);
-      console.log('Columns added successfully');
-    }
+    // Create notifications table if it doesn't exist
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS notifications (
+        id SERIAL PRIMARY KEY,
+        type VARCHAR(50),
+        message TEXT,
+        is_read BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        user_id VARCHAR(50),
+        sender_id VARCHAR(50),
+        sender_name VARCHAR(255),
+        sender_photo TEXT
+      )
+    `);
+
+    // Create leave_documents table if it doesn't exist
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS leave_documents (
+        id SERIAL PRIMARY KEY,
+        leave_id INTEGER NOT NULL,
+        file_name TEXT,
+        file_url TEXT,
+        file_size INTEGER,
+        upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (leave_id) REFERENCES leaves(id) ON DELETE CASCADE
+      )
+    `);
 
     await client.query('COMMIT');
+    console.log('All tables created/verified successfully');
   } catch (err) {
     await client.query('ROLLBACK');
-    if (err.code === '42501') { // Permission denied error
-      console.log('Permission denied. Using existing tables...');
-    } else {
-      console.error('Error checking/creating tables:', err);
-    }
+    console.error('Error creating tables:', err);
   } finally {
     client.release();
   }
 }
 
 // Call the function to create tables
-createTables();
+createTables().then(async () => {
+  // Create a default admin user if no users exist
+  try {
+    const userCount = await pool.query('SELECT COUNT(*) FROM employees');
+    if (parseInt(userCount.rows[0].count) === 0) {
+      await pool.query(`
+        INSERT INTO employees (
+          employee_id, full_name, email, mobile_number, 
+          designation, role, password, status
+        ) VALUES (
+          'ADMIN001', 'System Administrator', 'admin@buidco.com', '8002659674',
+          'Administrator', 'admin', 'admin123', 'Active'
+        )
+      `);
+      console.log('Default admin user created: admin@buidco.com / admin123');
+    }
+  } catch (err) {
+    console.log('Note: Could not create default admin user:', err.message);
+  }
+});
 
 // Add balance columns if they don't exist
 const addBalanceColumns = async () => {
   try {
+    // Check if leaves table exists first
+    const tableExists = await pool.query(`
+      SELECT EXISTS (
+        SELECT FROM information_schema.tables 
+        WHERE table_schema = 'public' 
+        AND table_name = 'leaves'
+      );
+    `);
+
+    if (!tableExists.rows[0].exists) {
+      console.log('Leaves table does not exist yet, skipping column additions');
+      return;
+    }
+
     await pool.query(`
       DO $$ 
       BEGIN 
@@ -166,7 +240,7 @@ const addBalanceColumns = async () => {
         AND l.designation IS NULL;
       END $$;
     `);
-    console.log('Columns added successfully');
+    console.log('Balance columns verified/added successfully');
   } catch (err) {
     console.error('Error adding columns:', err);
   }
@@ -197,21 +271,29 @@ addBalanceColumns();
   }
 })();
 
-// Create leave_documents table if not exists
+// Create leave_documents table if not exists (after leaves table is ready)
 (async () => {
   try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS leave_documents (
-        id SERIAL PRIMARY KEY,
-        leave_id VARCHAR(20) REFERENCES leaves(id) ON DELETE CASCADE,
-        file_name TEXT,
-        file_url TEXT,
-        file_size INTEGER,
-        upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
+    // Wait a bit for other tables to be created first
+    setTimeout(async () => {
+      try {
+        await pool.query(`
+          CREATE TABLE IF NOT EXISTS leave_documents (
+            id SERIAL PRIMARY KEY,
+            leave_id INTEGER NOT NULL,
+            file_name TEXT,
+            file_url TEXT,
+            file_size INTEGER,
+            upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          );
+        `);
+        console.log('Leave documents table verified/created successfully');
+      } catch (err) {
+        console.error('Error creating leave_documents table:', err);
+      }
+    }, 2000);
   } catch (err) {
-    console.error('Error creating leave_documents table:', err);
+    console.error('Error in leave_documents table setup:', err);
   }
 })();
 
