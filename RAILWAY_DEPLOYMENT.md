@@ -34,6 +34,7 @@
 8. **Railway will automatically redeploy**
 
 ### ✅ After Setting DATABASE_URL, You Should See:
+
 ```
 ✅ Connected to PostgreSQL database successfully
 🔧 Attempting to create/check database tables...
