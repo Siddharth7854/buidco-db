@@ -21,11 +21,15 @@ const pool = new Pool({
   ssl: process.env.NODE_ENV === 'production' ? {
     rejectUnauthorized: false,
     require: true
-  } : false,
-  // Add connection timeout and retry options
-  connectionTimeoutMillis: 10000,
+  } : {
+    rejectUnauthorized: false
+  },
+  // Add connection timeout and retry options for Render
+  connectionTimeoutMillis: 20000,
   idleTimeoutMillis: 30000,
-  max: 10,
+  max: 5, // Reduced for Render free tier
+  min: 1,
+  acquireTimeoutMillis: 20000,
   // Force IPv4 to avoid IPv6 connectivity issues
   options: process.env.NODE_ENV === 'production' ? '-c default_transaction_isolation=read_committed' : undefined
 });

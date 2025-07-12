@@ -15,6 +15,9 @@ yarn-error.log*
 *.sqlite
 *.db
 
+# Test files
+test-db.js
+
 # Logs
 logs
 *.log
