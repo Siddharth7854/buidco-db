@@ -15,22 +15,21 @@ const port = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
-// PostgreSQL Connection with improved error handling
+// PostgreSQL Connection with improved error handling for Render
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL || `postgresql://${process.env.PGUSER}:${process.env.PGPASSWORD}@${process.env.PGHOST}:${process.env.PGPORT}/${process.env.PGDATABASE}?sslmode=require`,
   ssl: process.env.NODE_ENV === 'production' ? {
-    rejectUnauthorized: false,
-    require: true
+    rejectUnauthorized: false
   } : {
     rejectUnauthorized: false
   },
-  // Add connection timeout and retry options for Render
-  connectionTimeoutMillis: 20000,
+  // Connection timeout and pool options optimized for Render
+  connectionTimeoutMillis: 30000,
   idleTimeoutMillis: 30000,
-  max: 5, // Reduced for Render free tier
+  max: 5,
   min: 1,
-  acquireTimeoutMillis: 20000
-  // Removed the problematic options parameter
+  acquireTimeoutMillis: 20000,
+  // Removed all problematic options that cause parameter errors on Render
 });
 
 // Test database connection with retry logic
