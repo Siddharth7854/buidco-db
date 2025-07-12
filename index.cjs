@@ -29,9 +29,8 @@ const pool = new Pool({
   idleTimeoutMillis: 30000,
   max: 5, // Reduced for Render free tier
   min: 1,
-  acquireTimeoutMillis: 20000,
-  // Force IPv4 to avoid IPv6 connectivity issues
-  options: process.env.NODE_ENV === 'production' ? '-c default_transaction_isolation=read_committed' : undefined
+  acquireTimeoutMillis: 20000
+  // Removed the problematic options parameter
 });
 
 // Test database connection with retry logic
