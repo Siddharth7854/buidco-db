@@ -5,6 +5,9 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 
+// Load environment variables
+require('dotenv').config();
+
 const app = express();
 const port = process.env.PORT || 5000;
 
@@ -14,20 +17,23 @@ app.use(express.json());
 
 // PostgreSQL Connection
 const pool = new Pool({
-  user: 'postgres',
-  host: 'localhost',
-  database: 'buidco_leave',
-  password: 'sid91221',
-  port: 5432,
+  connectionString: process.env.DATABASE_URL || `postgresql://${process.env.PGUSER}:${process.env.PGPASSWORD}@${process.env.PGHOST}:${process.env.PGPORT}/${process.env.PGDATABASE}?sslmode=${process.env.PGSSLMODE}`,
+  ssl: process.env.NODE_ENV === 'production' || process.env.PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false
 });
 
 // Test database connection
 pool.query('SELECT NOW()', (err, res) => {
   if (err) {
     console.error('Error connecting to the database:', err);
+    console.log('DATABASE_URL:', process.env.DATABASE_URL ? 'Set' : 'Not set');
   } else {
     console.log('Connected to PostgreSQL database');
   }
+});
+
+// Handle pool errors
+pool.on('error', (err, client) => {
+  console.error('Unexpected error on idle client', err);
 });
 
 // Multer config for leave documents
