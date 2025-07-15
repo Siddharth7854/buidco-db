@@ -2037,7 +2037,29 @@ app.post('/api/notifications/test', async (req, res) => {
   }
 });
 
+// Health check endpoint for Render
+app.get('/health', (req, res) => {
+  res.status(200).json({ 
+    status: 'healthy', 
+    timestamp: new Date().toISOString(),
+    service: 'BLMS Backend'
+  });
+});
+
 // Start server
-app.listen(port, () => {
+const server = app.listen(port, '0.0.0.0', () => {
   console.log(`Server is running on port ${port}`);
+  console.log('Database:', pool ? 'Connected' : 'Not connected');
+  console.log('Environment:', process.env.NODE_ENV || 'development');
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received, shutting down gracefully');
+  server.close(() => {
+    console.log('Process terminated');
+    if (pool) {
+      pool.end();
+    }
+  });
 });

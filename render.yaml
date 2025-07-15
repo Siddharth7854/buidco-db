@@ -3,12 +3,12 @@ services:
     name: blms-backend
     env: node
     plan: free
-    buildCommand: npm ci
-    startCommand: node index.cjs
+    buildCommand: npm run render-build
+    startCommand: npm start
     envVars:
       - key: NODE_ENV
         value: production
       - key: DATABASE_URL
         sync: false # Set this manually in Render dashboard
     autoDeploy: true
-    healthCheckPath: /api/health
+    healthCheckPath: /health
