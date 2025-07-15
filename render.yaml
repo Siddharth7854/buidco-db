@@ -3,8 +3,8 @@ services:
     name: blms-backend
     env: node
     plan: free
-    buildCommand: npm run render-build
-    startCommand: npm start
+    buildCommand: npm install --force
+    startCommand: node index.cjs
     envVars:
       - key: NODE_ENV
         value: production

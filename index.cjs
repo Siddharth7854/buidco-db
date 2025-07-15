@@ -1,32 +1,44 @@
-// Error handling and module validation
-try {
-  const express = require('express');
-  const cors = require('cors');
-  const { Pool } = require('pg');
-  const multer = require('multer');
-  const path = require('path');
-  const fs = require('fs');
+// Robust module loading with Express router fix
+let express, cors, Pool, multer, path, fs;
 
-  // Validate Express installation
+try {
+  // Clear module cache to prevent conflicts
+  delete require.cache[require.resolve('express')];
+  
+  express = require('express');
+  cors = require('cors');
+  Pool = require('pg').Pool;
+  multer = require('multer');
+  path = require('path');
+  fs = require('fs');
+
+  // Validate Express and its router
   if (!express || typeof express !== 'function') {
     throw new Error('Express module not properly loaded');
   }
+  
+  // Test Express app creation to validate router
+  const testApp = express();
+  if (!testApp || !testApp.use) {
+    throw new Error('Express router validation failed');
+  }
 
-  console.log('✅ All modules loaded successfully');
+  console.log('✅ All modules validated successfully');
   console.log('Express version:', require('express/package.json').version);
+  console.log('Node version:', process.version);
   
 } catch (error) {
-  console.error('❌ Module loading error:', error.message);
-  console.error('Please run: npm install --force');
+  console.error('❌ Critical module error:', error.message);
+  console.error('Stack:', error.stack);
+  
+  // Force reinstall guidance
+  console.error('\n🔧 SOLUTION: Run these commands:');
+  console.error('1. rm -rf node_modules package-lock.json');
+  console.error('2. npm cache clean --force');
+  console.error('3. npm install --force');
+  
   process.exit(1);
 }
-
-const express = require('express');
-const cors = require('cors');
-const { Pool } = require('pg');
-const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
 
 // Load environment variables
 require('dotenv').config();
