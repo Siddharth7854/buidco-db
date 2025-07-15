@@ -1,3 +1,26 @@
+// Error handling and module validation
+try {
+  const express = require('express');
+  const cors = require('cors');
+  const { Pool } = require('pg');
+  const multer = require('multer');
+  const path = require('path');
+  const fs = require('fs');
+
+  // Validate Express installation
+  if (!express || typeof express !== 'function') {
+    throw new Error('Express module not properly loaded');
+  }
+
+  console.log('✅ All modules loaded successfully');
+  console.log('Express version:', require('express/package.json').version);
+  
+} catch (error) {
+  console.error('❌ Module loading error:', error.message);
+  console.error('Please run: npm install --force');
+  process.exit(1);
+}
+
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');

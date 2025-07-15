@@ -1,13 +1,15 @@
 {
   "name": "blms-mobile-backend",
   "version": "1.0.0",
+  "description": "BLMS Backend Server for Employee Management",
   "main": "index.cjs",
   "scripts": {
     "start": "node index.cjs",
-    "dev": "node index.cjs", 
-    "build": "npm install --production --force",
-    "postinstall": "npm list express || npm install express@^4.19.2 --save",
-    "clean": "rm -rf node_modules package-lock.json && npm install",
+    "dev": "nodemon index.cjs",
+    "build": "npm ci --only=production",
+    "render-build": "npm install --force && npm audit fix",
+    "postinstall": "node --version && npm --version",
+    "clean": "rm -rf node_modules package-lock.json",
     "test": "echo 'No tests specified'"
   },
   "dependencies": {
@@ -17,8 +19,14 @@
     "multer": "^1.4.5-lts.1",
     "pg": "^8.12.0"
   },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
   "engines": {
-    "node": ">=18.0.0",
+    "node": "18.x",
     "npm": ">=8.0.0"
-  }
+  },
+  "keywords": ["express", "postgresql", "api", "employee-management"],
+  "author": "BLMS Team",
+  "license": "MIT"
 }

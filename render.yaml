@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: blms-backend
+    env: node
+    plan: free
+    buildCommand: npm ci
+    startCommand: node index.cjs
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false # Set this manually in Render dashboard
+    autoDeploy: true
+    healthCheckPath: /api/health
