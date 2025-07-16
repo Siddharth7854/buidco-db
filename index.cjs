@@ -2075,3 +2075,34 @@ process.on('SIGTERM', () => {
     }
   });
 });
+
+const os = require('os');
+// System health check endpoint
+app.get('/api/system/health', (req, res) => {
+  const totalMem = os.totalmem();
+  const freeMem = os.freemem();
+  const usedMem = totalMem - freeMem;
+  const memUsage = (usedMem / totalMem) * 100;
+
+  const cpus = os.cpus();
+  const cpuLoad = cpus.map(cpu => {
+    const total = Object.values(cpu.times).reduce((a, b) => a + b, 0);
+    return ((total - cpu.times.idle) / total) * 100;
+  });
+  const avgCpu = cpuLoad.reduce((a, b) => a + b, 0) / cpuLoad.length;
+
+  res.json({
+    memory: {
+      total: totalMem,
+      free: freeMem,
+      used: usedMem,
+      percent: memUsage
+    },
+    cpu: {
+      percent: avgCpu
+    },
+    uptime: os.uptime(),
+    loadavg: os.loadavg(),
+    timestamp: new Date().toISOString()
+  });
+});
