@@ -1,5 +1,5 @@
 // Robust module loading with Express router fix
-let express, cors, Pool, multer, path, fs;
+let express, cors, multer, path, fs;
 
 try {
   // Clear module cache to prevent conflicts
@@ -7,7 +7,6 @@ try {
   
   express = require('express');
   cors = require('cors');
-  Pool = require('pg').Pool;
   multer = require('multer');
   path = require('path');
   fs = require('fs');
@@ -112,58 +111,18 @@ app.get('/', (req, res) => {
       leaves: '/api/leaves',
       notifications: '/api/notifications'
     },
-    database: process.env.DATABASE_URL ? 'Connected' : 'Not configured',
+    database: process.env.DB_SERVER ? 'SQL Server Configured' : 'Not configured',
     timestamp: new Date().toISOString()
   });
 });
 
-// PostgreSQL Connection with improved error handling for Render
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL || `postgresql://${process.env.PGUSER}:${process.env.PGPASSWORD}@${process.env.PGHOST}:${process.env.PGPORT}/${process.env.PGDATABASE}?sslmode=require`,
-  ssl: process.env.NODE_ENV === 'production' ? {
-    rejectUnauthorized: false
-  } : {
-    rejectUnauthorized: false
-  },
-  // Connection timeout and pool options optimized for Render
-  connectionTimeoutMillis: 30000,
-  idleTimeoutMillis: 30000,
-  max: 5,
-  min: 1,
-  acquireTimeoutMillis: 20000,
-  // Removed all problematic options that cause parameter errors on Render
+const { pool, connect } = require('./db');
+const sql = require('mssql');
+
+// On server start, call connect with retry
+connect().catch(err => {
+  console.error('❌ Failed to connect to database after retries:', err.message);
 });
-
-// Test database connection with retry logic
-async function testDatabaseConnection() {
-  let retries = 3;
-  while (retries > 0) {
-    try {
-      const result = await pool.query('SELECT NOW()');
-      console.log('✅ Connected to PostgreSQL database successfully');
-      console.log('Database time:', result.rows[0].now);
-      return true;
-    } catch (err) {
-      console.error(`❌ Database connection attempt failed (${4-retries}/3):`, err.message);
-      console.log('Environment check:');
-      console.log('- DATABASE_URL:', process.env.DATABASE_URL ? '✅ Set' : '❌ Not set');
-      console.log('- NODE_ENV:', process.env.NODE_ENV || 'development');
-      console.log('- Port:', process.env.PORT || 5000);
-      
-      retries--;
-      if (retries > 0) {
-        console.log(`Retrying in 5 seconds... (${retries} attempts left)`);
-        await new Promise(resolve => setTimeout(resolve, 5000));
-      }
-    }
-  }
-  console.error('🚨 Failed to connect to database after 3 attempts');
-  console.log('💡 Please check your Railway PostgreSQL service and DATABASE_URL environment variable');
-  return false;
-}
-
-// Test connection on startup
-testDatabaseConnection();
 
 // Handle pool errors
 pool.on('error', (err, client) => {
@@ -226,22 +185,20 @@ app.use((err, req, res, next) => {
 
 // Create tables if they don't exist
 async function createTables() {
-  // Skip table creation if DATABASE_URL is not set
-  if (!process.env.DATABASE_URL) {
-    console.log('⚠️ DATABASE_URL not set, skipping table creation');
-    console.log('📋 Please set DATABASE_URL in Railway environment variables');
+  // Skip table creation if SQL Server config is not set
+  if (!process.env.DB_SERVER && !process.env.DB_NAME) {
+    console.log('⚠️ SQL Server configuration not set, skipping table creation');
+    console.log('📋 Please set DB_SERVER, DB_NAME, DB_USER, DB_PASSWORD in environment variables');
     return false;
   }
 
-  let client;
   try {
     console.log('🔧 Attempting to create/check database tables...');
-    client = await pool.connect();
-    await client.query('BEGIN');
-
+    
     // Create employees table if it doesn't exist
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS employees (
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='employees' AND xtype='U')
+      CREATE TABLE employees (
         employee_id VARCHAR(50) PRIMARY KEY,
         full_name VARCHAR(255) NOT NULL,
         email VARCHAR(255) UNIQUE NOT NULL,
@@ -253,37 +210,38 @@ async function createTables() {
         password VARCHAR(255) NOT NULL,
         status VARCHAR(20) DEFAULT 'Active',
         profile_photo TEXT,
-        cl_balance INTEGER DEFAULT 16,
-        rh_balance INTEGER DEFAULT 3,
-        el_balance INTEGER DEFAULT 18,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        cl_balance INT DEFAULT 16,
+        rh_balance INT DEFAULT 3,
+        el_balance INT DEFAULT 18,
+        created_at DATETIME DEFAULT GETDATE(),
+        updated_at DATETIME DEFAULT GETDATE()
       )
     `);
 
     // Update existing employees CL balance from 10 to 16
-    await client.query(`
+    await pool.request().query(`
       UPDATE employees SET cl_balance = 16 WHERE cl_balance = 10
     `);
 
     console.log('✅ Updated existing employees CL balance from 10 to 16');
 
     // Create leaves table if it doesn't exist
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS leaves (
-        id SERIAL PRIMARY KEY,
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='leaves' AND xtype='U')
+      CREATE TABLE leaves (
+        id INT IDENTITY(1,1) PRIMARY KEY,
         employee_id VARCHAR(50) NOT NULL,
         employee_name VARCHAR(255) NOT NULL,
         type VARCHAR(10) NOT NULL CHECK (type IN ('CL', 'EL', 'RH', 'SL')),
         start_date DATE NOT NULL,
         end_date DATE NOT NULL,
-        days INTEGER NOT NULL,
+        days INT NOT NULL,
         reason TEXT,
         status VARCHAR(20) DEFAULT 'Pending' CHECK (status IN ('Pending', 'Approved', 'Rejected', 'Cancelled')),
-        applied_on TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        approved_date TIMESTAMP,
-        rejected_date TIMESTAMP,
-        cancelled_date TIMESTAMP,
+        applied_on DATETIME DEFAULT GETDATE(),
+        approved_date DATETIME,
+        rejected_date DATETIME,
+        cancelled_date DATETIME,
         location VARCHAR(255),
         remarks TEXT,
         designation VARCHAR(255),
@@ -295,13 +253,14 @@ async function createTables() {
     `);
 
     // Create notifications table if it doesn't exist
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS notifications (
-        id SERIAL PRIMARY KEY,
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='notifications' AND xtype='U')
+      CREATE TABLE notifications (
+        id INT IDENTITY(1,1) PRIMARY KEY,
         type VARCHAR(50),
         message TEXT,
-        is_read BOOLEAN DEFAULT FALSE,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        is_read BIT DEFAULT 0,
+        created_at DATETIME DEFAULT GETDATE(),
         user_id VARCHAR(50),
         sender_id VARCHAR(50),
         sender_name VARCHAR(255),
@@ -310,35 +269,31 @@ async function createTables() {
     `);
 
     // Create leave_documents table if it doesn't exist
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS leave_documents (
-        id SERIAL PRIMARY KEY,
-        leave_id INTEGER NOT NULL,
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='leave_documents' AND xtype='U')
+      CREATE TABLE leave_documents (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        leave_id INT NOT NULL,
         file_name TEXT,
         file_url TEXT,
-        file_size INTEGER,
-        upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        file_size INT,
+        upload_date DATETIME DEFAULT GETDATE(),
         FOREIGN KEY (leave_id) REFERENCES leaves(id) ON DELETE CASCADE
       )
     `);
 
-    await client.query('COMMIT');
     console.log('✅ All tables created/verified successfully');
     return true;
   } catch (err) {
-    if (client) await client.query('ROLLBACK');
-    
     if (err.code === 'ENETUNREACH' || err.code === 'ENOTFOUND' || err.code === 'ECONNREFUSED') {
-      console.log('🌐 Database connection issue - this is normal during Railway deployment startup');
-      console.log('💡 Railway PostgreSQL service may still be initializing, retrying later...');
+      console.log('🌐 Database connection issue - this is normal during deployment startup');
+      console.log('💡 SQL Server service may still be initializing, retrying later...');
     } else if (err.code === '42501') {
       console.log('🔒 Permission denied - tables may already exist');
     } else {
       console.error('❌ Error creating tables:', err.message);
     }
     return false;
-  } finally {
-    if (client) client.release();
   }
 }
 
@@ -354,9 +309,9 @@ async function initializeDatabase() {
     if (success) {
       // Create a default admin user if no users exist
       try {
-        const userCount = await pool.query('SELECT COUNT(*) FROM employees');
-        if (parseInt(userCount.rows[0].count) === 0) {
-          await pool.query(`
+        const userCount = await pool.request().query('SELECT COUNT(*) as count FROM employees');
+        if (parseInt(userCount.recordset[0].count) === 0) {
+          await pool.request().query(`
             INSERT INTO employees (
               employee_id, full_name, email, mobile_number, 
               designation, role, password, status
@@ -390,42 +345,34 @@ setTimeout(initializeDatabase, 8000);
 
 // Add balance columns if they don't exist
 const addBalanceColumns = async () => {
-  // Skip if DATABASE_URL is not set
-  if (!process.env.DATABASE_URL) {
-    console.log('⚠️ DATABASE_URL not set, skipping balance column check');
+  // Skip if SQL Server config is not set
+  if (!process.env.DB_SERVER && !process.env.DB_NAME) {
+    console.log('⚠️ SQL Server configuration not set, skipping balance column check');
     return;
   }
 
   try {
     // Check if leaves table exists first
-    const tableExists = await pool.query(`
-      SELECT EXISTS (
-        SELECT FROM information_schema.tables 
-        WHERE table_schema = 'public' 
-        AND table_name = 'leaves'
-      );
+    const tableExists = await pool.request().query(`
+      SELECT CASE WHEN EXISTS (SELECT * FROM sysobjects WHERE name='leaves' AND xtype='U') THEN 1 ELSE 0 END as table_exists
     `);
 
-    if (!tableExists.rows[0].exists) {
+    if (!tableExists.recordset[0].table_exists) {
       console.log('ℹ️ Leaves table does not exist yet, skipping column additions');
       return;
     }
 
-    await pool.query(`
-      DO $$ 
-      BEGIN 
-        -- Add designation column to leaves table if it doesn't exist
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='leaves' AND column_name='designation') THEN
-          ALTER TABLE leaves ADD COLUMN designation VARCHAR(255);
-        END IF;
+    await pool.request().query(`
+      -- Add designation column to leaves table if it doesn't exist
+      IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('leaves') AND name = 'designation')
+        ALTER TABLE leaves ADD designation VARCHAR(255);
 
-        -- Update existing leaves with designation from employees
-        UPDATE leaves l 
-        SET designation = e.designation 
-        FROM employees e 
-        WHERE l.employee_id = e.employee_id 
-        AND l.designation IS NULL;
-      END $$;
+      -- Update existing leaves with designation from employees
+      UPDATE leaves 
+      SET designation = e.designation 
+      FROM employees e 
+      WHERE leaves.employee_id = e.employee_id 
+      AND leaves.designation IS NULL;
     `);
     console.log('✅ Balance columns verified/added successfully');
   } catch (err) {
@@ -442,27 +389,28 @@ setTimeout(addBalanceColumns, 12000);
 
 // Ensure additional tables exist (with error handling)
 const ensureAdditionalTables = async () => {
-  // Skip if DATABASE_URL is not set
-  if (!process.env.DATABASE_URL) {
-    console.log('⚠️ DATABASE_URL not set, skipping additional table creation');
+  // Skip if SQL Server config is not set
+  if (!process.env.DB_SERVER && !process.env.DB_NAME) {
+    console.log('⚠️ SQL Server configuration not set, skipping additional table creation');
     return;
   }
 
   try {
     // This is redundant since notifications table is created in createTables(),
     // but keeping for safety
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS notifications (
-        id SERIAL PRIMARY KEY,
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='notifications' AND xtype='U')
+      CREATE TABLE notifications (
+        id INT IDENTITY(1,1) PRIMARY KEY,
         type VARCHAR(50),
         message TEXT,
-        is_read BOOLEAN DEFAULT FALSE,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        user_id INTEGER,
+        is_read BIT DEFAULT 0,
+        created_at DATETIME DEFAULT GETDATE(),
+        user_id VARCHAR(50),
         sender_id VARCHAR(50),
         sender_name VARCHAR(255),
         sender_photo TEXT
-      );
+      )
     `);
     console.log('✅ Additional tables verified/created successfully');
   } catch (err) {
@@ -481,13 +429,16 @@ setTimeout(ensureAdditionalTables, 15000);
 app.get('/api/employees/bulk-update-el-balance-all', async (req, res) => {
   console.log('Bulk update endpoint hit');
   try {
-    const result = await pool.query(
-      'UPDATE employees SET el_balance = 18 WHERE el_balance != 18 OR el_balance IS NULL RETURNING employee_id, el_balance'
+    await pool.request().query(
+      'UPDATE employees SET el_balance = 18 WHERE el_balance != 18 OR el_balance IS NULL'
+    );
+    const result = await pool.request().query(
+      'SELECT employee_id, el_balance FROM employees WHERE el_balance = 18'
     );
     res.json({ 
       success: true, 
-      message: `Updated ${result.rows.length} employees' earned leave balance to 18`,
-      updatedEmployees: result.rows
+      message: `Updated ${result.recordset.length} employees' earned leave balance to 18`,
+      updatedEmployees: result.recordset
     });
   } catch (err) {
     console.error('Error bulk updating earned leave balance:', err);
@@ -499,13 +450,16 @@ app.get('/api/employees/bulk-update-el-balance-all', async (req, res) => {
 app.get('/api/employees/bulk-update-cl-balance-all', async (req, res) => {
   console.log('Bulk update CL balance endpoint hit');
   try {
-    const result = await pool.query(
-      'UPDATE employees SET cl_balance = 16 WHERE cl_balance != 16 OR cl_balance IS NULL RETURNING employee_id, cl_balance'
+    await pool.request().query(
+      'UPDATE employees SET cl_balance = 16 WHERE cl_balance != 16 OR cl_balance IS NULL'
+    );
+    const result = await pool.request().query(
+      'SELECT employee_id, cl_balance FROM employees WHERE cl_balance = 16'
     );
     res.json({ 
       success: true, 
-      message: `Updated ${result.rows.length} employees' casual leave balance to 16`,
-      updatedEmployees: result.rows
+      message: `Updated ${result.recordset.length} employees' casual leave balance to 16`,
+      updatedEmployees: result.recordset
     });
   } catch (err) {
     console.error('Error bulk updating casual leave balance:', err);
@@ -517,14 +471,13 @@ app.get('/api/employees/bulk-update-cl-balance-all', async (req, res) => {
 app.delete('/api/employees/:employeeId', async (req, res) => {
   try {
     const { employeeId } = req.params;
-    const result = await pool.query(
-      'DELETE FROM employees WHERE employee_id = $1 RETURNING *',
-      [employeeId]
-    );
-    if (result.rows.length === 0) {
+    const result = await pool.request()
+      .input('employeeId', sql.VarChar, employeeId)
+      .query('DELETE FROM employees OUTPUT DELETED.* WHERE employee_id = @employeeId');
+    if (!result.recordset.length) {
       return res.status(404).json({ success: false, message: 'Employee not found' });
     }
-    res.json({ success: true, employee: result.rows[0] });
+    res.json({ success: true, employee: result.recordset[0] });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -541,68 +494,71 @@ app.patch('/api/employees/:employeeId', async (req, res) => {
 
     // Build dynamic update query
     const updateFields = [];
-    const updateValues = [];
+    const inputs = [];
     let paramCount = 1;
 
     if (full_name !== undefined) {
-      updateFields.push(`full_name = $${paramCount++}`);
-      updateValues.push(full_name);
+      updateFields.push(`full_name = @param${paramCount}`);
+      inputs.push({ name: `param${paramCount++}`, type: sql.VarChar, value: full_name });
     }
     if (email !== undefined) {
-      updateFields.push(`email = $${paramCount++}`);
-      updateValues.push(email);
+      updateFields.push(`email = @param${paramCount}`);
+      inputs.push({ name: `param${paramCount++}`, type: sql.VarChar, value: email });
     }
     if (mobile_number !== undefined) {
-      updateFields.push(`mobile_number = $${paramCount++}`);
-      updateValues.push(mobile_number);
+      updateFields.push(`mobile_number = @param${paramCount}`);
+      inputs.push({ name: `param${paramCount++}`, type: sql.VarChar, value: mobile_number });
     }
     if (designation !== undefined) {
-      updateFields.push(`designation = $${paramCount++}`);
-      updateValues.push(designation);
+      updateFields.push(`designation = @param${paramCount}`);
+      inputs.push({ name: `param${paramCount++}`, type: sql.VarChar, value: designation });
     }
     if (role !== undefined) {
-      updateFields.push(`role = $${paramCount++}`);
-      updateValues.push(role);
+      updateFields.push(`role = @param${paramCount}`);
+      inputs.push({ name: `param${paramCount++}`, type: sql.VarChar, value: role });
     }
     if (joining_date !== undefined) {
-      updateFields.push(`joining_date = $${paramCount++}`);
-      updateValues.push(joining_date);
+      updateFields.push(`joining_date = @param${paramCount}`);
+      inputs.push({ name: `param${paramCount++}`, type: sql.Date, value: joining_date });
     }
     if (current_posting !== undefined) {
-      updateFields.push(`current_posting = $${paramCount++}`);
-      updateValues.push(current_posting);
+      updateFields.push(`current_posting = @param${paramCount}`);
+      inputs.push({ name: `param${paramCount++}`, type: sql.VarChar, value: current_posting });
     }
     if (password !== undefined && password.trim() !== '') {
-      updateFields.push(`password = $${paramCount++}`);
-      updateValues.push(password);
+      updateFields.push(`password = @param${paramCount}`);
+      inputs.push({ name: `param${paramCount++}`, type: sql.VarChar, value: password });
     }
     if (status !== undefined) {
-      updateFields.push(`status = $${paramCount++}`);
-      updateValues.push(status);
+      updateFields.push(`status = @param${paramCount}`);
+      inputs.push({ name: `param${paramCount++}`, type: sql.VarChar, value: status });
     }
 
     if (updateFields.length === 0) {
       return res.status(400).json({ error: 'No fields to update' });
     }
 
-    updateValues.push(employeeId);
+    // Add employeeId as last param
+    inputs.push({ name: `param${paramCount}`, type: sql.VarChar, value: employeeId });
+    const setClause = updateFields.join(', ');
     const query = `
       UPDATE employees 
-      SET ${updateFields.join(', ')} 
-      WHERE employee_id = $${paramCount} 
-      RETURNING *
+      SET ${setClause} 
+      OUTPUT INSERTED.*
+      WHERE employee_id = @param${paramCount}
     `;
-
-    const result = await pool.query(query, updateValues);
-    
-    if (result.rows.length === 0) {
+    let request = pool.request();
+    for (const inp of inputs) {
+      request = request.input(inp.name, inp.type, inp.value);
+    }
+    const result = await request.query(query);
+    if (!result.recordset.length) {
       return res.status(404).json({ error: 'Employee not found' });
     }
-    
     res.json({
       success: true,
       message: 'Profile updated successfully',
-      employee: result.rows[0]
+      employee: result.recordset[0]
     });
   } catch (err) {
     console.error('Error updating employee:', err);
@@ -618,41 +574,44 @@ app.patch('/api/employees/:employeeId/leave-balances', async (req, res) => {
 
     // Build dynamic update query for leave balances
     const updateFields = [];
-    const updateValues = [];
+    const inputs = [];
     let paramCount = 1;
 
     if (cl_balance !== undefined) {
-      updateFields.push(`cl_balance = $${paramCount++}`);
-      updateValues.push(cl_balance);
+      updateFields.push(`cl_balance = @param${paramCount}`);
+      inputs.push({ name: `param${paramCount++}`, type: sql.Int, value: cl_balance });
     }
     if (rh_balance !== undefined) {
-      updateFields.push(`rh_balance = $${paramCount++}`);
-      updateValues.push(rh_balance);
+      updateFields.push(`rh_balance = @param${paramCount}`);
+      inputs.push({ name: `param${paramCount++}`, type: sql.Int, value: rh_balance });
     }
     if (el_balance !== undefined) {
-      updateFields.push(`el_balance = $${paramCount++}`);
-      updateValues.push(el_balance);
+      updateFields.push(`el_balance = @param${paramCount}`);
+      inputs.push({ name: `param${paramCount++}`, type: sql.Int, value: el_balance });
     }
 
     if (updateFields.length === 0) {
       return res.status(400).json({ error: 'No leave balance fields to update' });
     }
 
-    updateValues.push(employeeId);
+    // Add employeeId as last param
+    inputs.push({ name: `param${paramCount}`, type: sql.VarChar, value: employeeId });
+    const setClause = updateFields.join(', ');
     const query = `
       UPDATE employees 
-      SET ${updateFields.join(', ')} 
-      WHERE employee_id = $${paramCount} 
-      RETURNING *
+      SET ${setClause} 
+      OUTPUT INSERTED.*
+      WHERE employee_id = @param${paramCount}
     `;
-
-    const result = await pool.query(query, updateValues);
-    
-    if (result.rows.length === 0) {
+    let request = pool.request();
+    for (const inp of inputs) {
+      request = request.input(inp.name, inp.type, inp.value);
+    }
+    const result = await request.query(query);
+    if (!result.recordset.length) {
       return res.status(404).json({ error: 'Employee not found' });
     }
-    
-    res.json(result.rows[0]);
+    res.json(result.recordset[0]);
   } catch (err) {
     console.error('Error updating employee leave balances:', err);
     res.status(500).json({ error: err.message });
@@ -664,12 +623,12 @@ app.post('/api/login', async (req, res) => {
   const { email, employeeId, password } = req.body;
   const loginId = email || employeeId;
   try {
-    const result = await pool.query(
-      `SELECT * FROM employees WHERE (email = $1 OR employee_id = $1) AND password = $2 AND status = 'Active'`,
-      [loginId, password]
-    );
-    if (result.rows.length > 0) {
-      const user = result.rows[0];
+    const result = await pool.request()
+      .input('loginId', sql.VarChar, loginId)
+      .input('password', sql.VarChar, password)
+      .query(`SELECT * FROM employees WHERE (email = @loginId OR employee_id = @loginId) AND password = @password AND status = 'Active'`);
+    if (result.recordset.length > 0) {
+      const user = result.recordset[0];
       res.json({
         success: true,
         user: {
@@ -696,19 +655,25 @@ app.post('/api/employees', async (req, res) => {
     password, status
   } = req.body;
   try {
-    // First ensure the designation is not empty
     if (!designation) {
       return res.status(400).json({ error: 'Designation is required' });
     }
-
-    // Set default balances: CL=16, RH=3, EL=18 for every new user
-    const result = await pool.query(
-      `INSERT INTO employees
-      (employee_id, full_name, email, mobile_number, designation, role, joining_date, current_posting, password, status, cl_balance, rh_balance, el_balance)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, 16, 3, 18) RETURNING *`,
-      [employee_id, full_name, email, mobile_number, designation, role, joining_date, current_posting, password, status]
-    );
-    res.json(result.rows[0]);
+    const result = await pool.request()
+      .input('employee_id', sql.VarChar, employee_id)
+      .input('full_name', sql.VarChar, full_name)
+      .input('email', sql.VarChar, email)
+      .input('mobile_number', sql.VarChar, mobile_number)
+      .input('designation', sql.VarChar, designation)
+      .input('role', sql.VarChar, role)
+      .input('joining_date', sql.Date, joining_date)
+      .input('current_posting', sql.VarChar, current_posting)
+      .input('password', sql.VarChar, password)
+      .input('status', sql.VarChar, status)
+      .query(`INSERT INTO employees
+        (employee_id, full_name, email, mobile_number, designation, role, joining_date, current_posting, password, status, cl_balance, rh_balance, el_balance)
+        OUTPUT INSERTED.*
+        VALUES (@employee_id, @full_name, @email, @mobile_number, @designation, @role, @joining_date, @current_posting, @password, @status, 16, 3, 18)`);
+    res.json(result.recordset[0]);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -717,18 +682,14 @@ app.post('/api/employees', async (req, res) => {
 // Get all employees
 app.get('/api/employees', async (req, res) => {
   try {
-    console.log('📋 GET /api/employees called from origin:', req.headers.origin || 'no-origin');
-    
     const { employee_id } = req.query;
     if (employee_id) {
-      console.log('🔍 Fetching specific employee:', employee_id);
-      const result = await pool.query('SELECT * FROM employees WHERE employee_id = $1', [employee_id]);
-      console.log('✅ Found employee:', result.rows.length > 0 ? 'Yes' : 'No');
-      return res.json(result.rows);
+      const result = await pool.request()
+        .input('employee_id', sql.VarChar, employee_id)
+        .query('SELECT * FROM employees WHERE employee_id = @employee_id');
+      return res.json(result.recordset);
     }
-    
-    console.log('📋 Fetching all employees...');
-    const result = await pool.query(`
+    const result = await pool.request().query(`
       SELECT 
         ROW_NUMBER() OVER (ORDER BY employee_id) as id,
         employee_id, 
@@ -749,20 +710,9 @@ app.get('/api/employees', async (req, res) => {
       FROM employees 
       ORDER BY employee_id
     `);
-    
-    console.log(`✅ Found ${result.rows.length} employees`);
-    console.log('📊 Employee data sample:', result.rows.length > 0 ? {
-      id: result.rows[0].id,
-      employee_id: result.rows[0].employee_id,
-      full_name: result.rows[0].full_name,
-      role: result.rows[0].role
-    } : 'No employees found');
-    
-    // Set proper headers for JSON response
     res.setHeader('Content-Type', 'application/json');
-    res.json(result.rows);
+    res.json(result.recordset);
   } catch (err) {
-    console.error('❌ Error in GET /api/employees:', err);
     res.status(500).json({ 
       error: err.message,
       endpoint: '/api/employees',
@@ -776,7 +726,6 @@ app.get('/api/employees', async (req, res) => {
 app.post('/api/leaves', async (req, res) => {
   try {
     const { employeeId, type, startDate, endDate, reason, location } = req.body;
-    // Calculate days (duration) on backend for data integrity
     let days = 0;
     if (startDate && endDate) {
       const start = new Date(startDate);
@@ -784,36 +733,43 @@ app.post('/api/leaves', async (req, res) => {
       days = Math.floor((end - start) / (1000 * 60 * 60 * 24)) + 1;
     }
     // Get employee details including designation
-    const empResult = await pool.query(
-      'SELECT full_name, designation FROM employees WHERE employee_id = $1',
-      [employeeId]
-    );
-    if (empResult.rows.length === 0) {
+    const empResult = await pool.request()
+      .input('employeeId', sql.VarChar, employeeId)
+      .query('SELECT full_name, designation, profile_photo FROM employees WHERE employee_id = @employeeId');
+    if (!empResult.recordset.length) {
       console.error('Employee not found for employeeId:', employeeId);
       return res.status(404).json({ error: 'Employee not found' });
     }
-    const { full_name: employeeName, designation } = empResult.rows[0];
+    const { full_name: employeeName, designation, profile_photo } = empResult.recordset[0];
     if (!designation) {
       console.error('Employee designation not found for employeeId:', employeeId);
       return res.status(400).json({ error: 'Employee designation not found' });
     }
-    const result = await pool.query(
-      'INSERT INTO leaves (employee_id, employee_name, type, start_date, end_date, days, reason, status, applied_on, location, designation) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *',
-      [employeeId, employeeName, type, startDate, endDate, days, reason, 'Pending', new Date(), location, designation]
-    );
+    const result = await pool.request()
+      .input('employee_id', sql.VarChar, employeeId)
+      .input('employee_name', sql.VarChar, employeeName)
+      .input('type', sql.VarChar, type)
+      .input('start_date', sql.Date, startDate)
+      .input('end_date', sql.Date, endDate)
+      .input('days', sql.Int, days)
+      .input('reason', sql.VarChar, reason)
+      .input('status', sql.VarChar, 'Pending')
+      .input('applied_on', sql.DateTime, new Date())
+      .input('location', sql.VarChar, location)
+      .input('designation', sql.VarChar, designation)
+      .query(`INSERT INTO leaves (employee_id, employee_name, type, start_date, end_date, days, reason, status, applied_on, location, designation)
+        OUTPUT INSERTED.*
+        VALUES (@employee_id, @employee_name, @type, @start_date, @end_date, @days, @reason, @status, @applied_on, @location, @designation)`);
     // Add notification for admin with sender information
-    await pool.query(
-      `INSERT INTO notifications (type, message, user_id, sender_id, sender_name, created_at, sender_photo) 
-       VALUES ($1, $2, NULL, $3, $4, CURRENT_TIMESTAMP, $5)`,
-      [
-        'New Leave Request', 
-        `New leave request from ${employeeName} (${employeeId}) for ${type} from ${startDate} to ${endDate}.`,
-        employeeId,
-        employeeName + ' [' + (req.headers['x-source'] === 'app' ? 'App' : 'Web') + ']',
-        (await pool.query('SELECT profile_photo FROM employees WHERE employee_id = $1', [employeeId])).rows[0]?.profile_photo || null
-      ]
-    );
-    res.json(result.rows[0]);
+    await pool.request()
+      .input('type', sql.VarChar, 'New Leave Request')
+      .input('message', sql.VarChar, `New leave request from ${employeeName} (${employeeId}) for ${type} from ${startDate} to ${endDate}.`)
+      .input('sender_id', sql.VarChar, employeeId)
+      .input('sender_name', sql.VarChar, employeeName + ' [' + (req.headers['x-source'] === 'app' ? 'App' : 'Web') + ']')
+      .input('sender_photo', sql.VarChar, profile_photo || null)
+      .query(`INSERT INTO notifications (type, message, user_id, sender_id, sender_name, created_at, sender_photo)
+        VALUES (@type, @message, NULL, @sender_id, @sender_name, GETDATE(), @sender_photo)`);
+    res.json(result.recordset[0]);
   } catch (err) {
     console.error('Error in POST /api/leaves:', err);
     res.status(500).json({ error: err.message });
@@ -823,18 +779,16 @@ app.post('/api/leaves', async (req, res) => {
 // Get all leave requests
 app.get('/api/leaves', async (req, res) => {
   try {
-    const result = await pool.query(`
+    const result = await pool.request().query(`
       SELECT 
         l.*, 
-        COALESCE(l.designation, e.designation) as designation,
+        ISNULL(l.designation, e.designation) as designation,
         e.designation as employee_designation
       FROM leaves l 
       LEFT JOIN employees e ON l.employee_id = e.employee_id 
       ORDER BY l.applied_on DESC
     `);
-
-    // Map all possible cancellation fields for admin panel visibility
-    const transformedData = result.rows.map(row => {
+    const transformedData = result.recordset.map(row => {
       return {
         id: row.id,
         employeeId: row.employee_id,
@@ -854,30 +808,20 @@ app.get('/api/leaves', async (req, res) => {
         documentPath: row.document_path
       };
     });
-
     res.json(transformedData);
   } catch (err) {
-    console.error('Error in /api/leaves:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Get leave requests for specific employee (improved mapping, deduplication, filtering)
+// Get leave requests for specific employee
 app.get('/api/leaves/:employeeId', async (req, res) => {
   try {
     const { status } = req.query;
-    const result = await pool.query(
-      `SELECT 
-        l.*,
-        COALESCE(l.designation, e.designation) as designation
-      FROM leaves l 
-      LEFT JOIN employees e ON l.employee_id = e.employee_id 
-      WHERE l.employee_id = $1 
-      ORDER BY l.applied_on DESC`,
-      [req.params.employeeId]
-    );
-    let leaves = result.rows;
-    // Optional status filter
+    const result = await pool.request()
+      .input('employeeId', sql.VarChar, req.params.employeeId)
+      .query(`SELECT l.*, COALESCE(l.designation, e.designation) as designation FROM leaves l LEFT JOIN employees e ON l.employee_id = e.employee_id WHERE l.employee_id = @employeeId ORDER BY l.applied_on DESC`);
+    let leaves = result.recordset;
     if (status) {
       leaves = leaves.filter(l => (l.status || '').toLowerCase() === status.toLowerCase());
     }
@@ -888,7 +832,6 @@ app.get('/api/leaves/:employeeId', async (req, res) => {
         uniqueLeaves[leave.id] = leave;
       }
     }
-    // Map to consistent frontend format and include can_request_cancellation
     const mapped = Object.values(uniqueLeaves).map(leave => {
       return {
         id: leave.id,
@@ -900,7 +843,7 @@ app.get('/api/leaves/:employeeId', async (req, res) => {
         reason: leave.reason || '',
         appliedDate: leave.applied_on || leave.appliedDate || leave.created_at || '',
         approvedBy: leave.approved_by || leave.approvedBy || '',
-        icon: '', // let frontend guess icon
+        icon: '',
         designation: leave.designation || '',
         remarks: leave.remarks || '',
         approvedDate: leave.approved_date || '',
@@ -909,7 +852,6 @@ app.get('/api/leaves/:employeeId', async (req, res) => {
         location: leave.location || '',
       };
     });
-    // Sort by appliedDate DESC
     mapped.sort((a, b) => new Date(b.appliedDate) - new Date(a.appliedDate));
     res.json(mapped);
   } catch (err) {
@@ -920,100 +862,116 @@ app.get('/api/leaves/:employeeId', async (req, res) => {
 // Approve leave request
 // Approve leave request (robust, single implementation)
 app.patch('/api/leaves/:id/approve', async (req, res) => {
-  const client = await pool.connect();
+  const transaction = new sql.Transaction(pool);
   try {
-    await client.query('BEGIN');
+    await transaction.begin();
+    
     // Get leave details
-    const leaveResult = await client.query(
-      `SELECT l.*, e.designation 
-       FROM leaves l
-       JOIN employees e ON l.employee_id = e.employee_id
-       WHERE l.id = $1 FOR UPDATE`,
-      [req.params.id]
-    );
-    if (leaveResult.rows.length === 0) {
-      await client.query('ROLLBACK');
+    const leaveResult = await transaction.request()
+      .input('id', sql.Int, req.params.id)
+      .query(`
+        SELECT l.*, e.designation 
+        FROM leaves l
+        JOIN employees e ON l.employee_id = e.employee_id
+        WHERE l.id = @id
+      `);
+    
+    if (leaveResult.recordset.length === 0) {
+      await transaction.rollback();
       return res.status(404).json({ error: 'Leave not found' });
     }
-    const leave = leaveResult.rows[0];
+    
+    const leave = leaveResult.recordset[0];
+    
     // Robust status check (case-insensitive)
     if (typeof leave.status === 'string' && leave.status.trim().toLowerCase() === 'approved') {
-      await client.query('ROLLBACK');
+      await transaction.rollback();
       return res.status(400).json({ error: 'Leave already approved' });
     }
+    
     // Check leave balance
     const balanceColumn = {
       'CL': 'cl_balance',
       'EL': 'el_balance',
       'RH': 'rh_balance'
     }[leave.type];
+    
     if (!balanceColumn) {
-      await client.query('ROLLBACK');
+      await transaction.rollback();
       return res.status(400).json({ error: 'Invalid leave type' });
     }
-    const employeeResult = await client.query(
-      `SELECT ${balanceColumn} FROM employees 
-       WHERE employee_id = $1 FOR UPDATE`,
-      [leave.employee_id]
-    );
-    if (employeeResult.rows.length === 0) {
-      await client.query('ROLLBACK');
+    
+    const employeeResult = await transaction.request()
+      .input('employee_id', sql.VarChar, leave.employee_id)
+      .query(`SELECT ${balanceColumn} FROM employees WHERE employee_id = @employee_id`);
+    
+    if (employeeResult.recordset.length === 0) {
+      await transaction.rollback();
       return res.status(404).json({ error: 'Employee not found' });
     }
-    const currentBalance = employeeResult.rows[0][balanceColumn];
+    
+    const currentBalance = employeeResult.recordset[0][balanceColumn];
     if (currentBalance < leave.days) {
-      await client.query('ROLLBACK');
+      await transaction.rollback();
       return res.status(400).json({ 
         error: `Insufficient ${leave.type} balance` 
       });
     }
-    // Update leave status
-    const updateResult = await client.query(
-      `UPDATE leaves 
-       SET status = 'Approved', approved_date = NOW() 
-       WHERE id = $1 RETURNING *`,
-      [req.params.id]
-    );
-    // Deduct leave balance
-    await client.query(
-      `UPDATE employees 
-       SET ${balanceColumn} = ${balanceColumn} - $1 
-       WHERE employee_id = $2`,
-      [leave.days, leave.employee_id]
-    );
     
-    // Notify employee about approval (set sender_name and sender_photo to employee info, append [App]/[Web] based on x-source)
-    const empInfo = await client.query('SELECT full_name, profile_photo FROM employees WHERE employee_id = $1', [leave.employee_id]);
-    let empName = empInfo.rows[0]?.full_name || 'Employee';
-    const empPhoto = empInfo.rows[0]?.profile_photo || null;
+    // Update leave status
+    const updateResult = await transaction.request()
+      .input('id', sql.Int, req.params.id)
+      .query(`
+        UPDATE leaves 
+        SET status = 'Approved', approved_date = GETDATE() 
+        OUTPUT INSERTED.*
+        WHERE id = @id
+      `);
+    
+    // Deduct leave balance
+    await transaction.request()
+      .input('days', sql.Int, leave.days)
+      .input('employee_id', sql.VarChar, leave.employee_id)
+      .query(`
+        UPDATE employees 
+        SET ${balanceColumn} = ${balanceColumn} - @days 
+        WHERE employee_id = @employee_id
+      `);
+    
+    // Notify employee about approval
+    const empInfo = await transaction.request()
+      .input('employee_id', sql.VarChar, leave.employee_id)
+      .query('SELECT full_name, profile_photo FROM employees WHERE employee_id = @employee_id');
+    
+    let empName = empInfo.recordset[0]?.full_name || 'Employee';
+    const empPhoto = empInfo.recordset[0]?.profile_photo || null;
     const source = req.headers['x-source'] === 'app' ? 'App' : 'Web';
+    
     if (!/\[(App|Web)\]$/.test(empName)) {
       empName = empName + ` [${source}]`;
     }
-    await client.query(
-      `INSERT INTO notifications (type, message, user_id, sender_id, sender_name, sender_photo, created_at) 
-       VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)`,
-      [
-        'leave_approved',
-        `Your ${leave.type} leave request from ${leave.start_date} to ${leave.end_date} has been approved.`,
-        leave.employee_id,
-        leave.employee_id,
-        empName,
-        empPhoto
-      ]
-    );
     
-    await client.query('COMMIT');
-    res.json({ success: true, leave: updateResult.rows[0] });
+    await transaction.request()
+      .input('type', sql.VarChar, 'leave_approved')
+      .input('message', sql.VarChar, `Your ${leave.type} leave request from ${leave.start_date} to ${leave.end_date} has been approved.`)
+      .input('user_id', sql.VarChar, leave.employee_id)
+      .input('sender_id', sql.VarChar, leave.employee_id)
+      .input('sender_name', sql.VarChar, empName)
+      .input('sender_photo', sql.VarChar, empPhoto)
+      .query(`
+        INSERT INTO notifications (type, message, user_id, sender_id, sender_name, sender_photo, created_at) 
+        VALUES (@type, @message, @user_id, @sender_id, @sender_name, @sender_photo, GETDATE())
+      `);
+    
+    await transaction.commit();
+    res.json({ success: true, leave: updateResult.recordset[0] });
   } catch (err) {
-    await client.query('ROLLBACK');
+    await transaction.rollback();
     res.status(500).json({ 
       error: err.message || 'Failed to approve leave',
       details: err.detail || null,
       stack: err.stack || null
     });
-  } finally {
-    client.release();
   }
 });
 
@@ -1021,39 +979,49 @@ app.patch('/api/leaves/:id/approve', async (req, res) => {
 app.patch('/api/leaves/:id/reject', async (req, res) => {
   try {
     const { remarks } = req.body;
-    const result = await pool.query(
-      'UPDATE leaves SET status = $1, remarks = $2, rejected_date = NOW() WHERE id::text = $3 RETURNING *',
-      ['Rejected', remarks, req.params.id]
-    );
+    const result = await pool.request()
+      .input('status', sql.VarChar, 'Rejected')
+      .input('remarks', sql.VarChar, remarks)
+      .input('id', sql.Int, req.params.id)
+      .query(`
+        UPDATE leaves 
+        SET status = @status, remarks = @remarks, rejected_date = GETDATE() 
+        OUTPUT INSERTED.*
+        WHERE id = @id
+      `);
 
-    if (result.rows.length === 0) {
+    if (result.recordset.length === 0) {
       return res.status(404).json({ success: false, message: 'Leave request not found' });
     }
 
-    const leave = result.rows[0];
+    const leave = result.recordset[0];
     
-    // Notify employee about rejection (set sender_name and sender_photo to employee info, append [App]/[Web] based on x-source)
-    const empInfo = await pool.query('SELECT full_name, profile_photo FROM employees WHERE employee_id = $1', [leave.employee_id]);
-    let empName = empInfo.rows[0]?.full_name || 'Employee';
-    const empPhoto = empInfo.rows[0]?.profile_photo || null;
+    // Notify employee about rejection
+    const empInfo = await pool.request()
+      .input('employee_id', sql.VarChar, leave.employee_id)
+      .query('SELECT full_name, profile_photo FROM employees WHERE employee_id = @employee_id');
+    
+    let empName = empInfo.recordset[0]?.full_name || 'Employee';
+    const empPhoto = empInfo.recordset[0]?.profile_photo || null;
     const source = req.headers['x-source'] === 'app' ? 'App' : 'Web';
+    
     if (!/\[(App|Web)\]$/.test(empName)) {
       empName = empName + ` [${source}]`;
     }
-    await pool.query(
-      `INSERT INTO notifications (type, message, user_id, sender_id, sender_name, sender_photo, created_at) 
-       VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)`,
-      [
-        'leave_rejected',
-        `Your ${leave.type} leave request from ${leave.start_date} to ${leave.end_date} has been rejected. ${remarks ? `Reason: ${remarks}` : ''}`,
-        leave.employee_id,
-        leave.employee_id,
-        empName,
-        empPhoto
-      ]
-    );
+    
+    await pool.request()
+      .input('type', sql.VarChar, 'leave_rejected')
+      .input('message', sql.VarChar, `Your ${leave.type} leave request from ${leave.start_date} to ${leave.end_date} has been rejected. ${remarks ? `Reason: ${remarks}` : ''}`)
+      .input('user_id', sql.VarChar, leave.employee_id)
+      .input('sender_id', sql.VarChar, leave.employee_id)
+      .input('sender_name', sql.VarChar, empName)
+      .input('sender_photo', sql.VarChar, empPhoto)
+      .query(`
+        INSERT INTO notifications (type, message, user_id, sender_id, sender_name, sender_photo, created_at) 
+        VALUES (@type, @message, @user_id, @sender_id, @sender_name, @sender_photo, GETDATE())
+      `);
 
-    res.json({ success: true, leave: result.rows[0] });
+    res.json({ success: true, leave: result.recordset[0] });
   } catch (err) {
     console.error('Error in reject leave:', err);
     res.status(500).json({ success: false, message: err.message });
@@ -1062,32 +1030,32 @@ app.patch('/api/leaves/:id/reject', async (req, res) => {
 
 // Cancel leave request
 app.patch('/api/leaves/:id/cancel', async (req, res) => {
-  const client = await pool.connect();
+  const transaction = new sql.Transaction(pool); 
   try {
     console.log('Starting leave cancellation process for ID:', req.params.id);
-    await client.query('BEGIN');
+    await transaction.begin();
 
     // Get the leave request details
     console.log('Fetching leave request details...');
-    const leaveResult = await client.query(
-      'SELECT * FROM leaves WHERE id::text = $1',
-      [req.params.id]
-    );
-    console.log('Leave request found:', leaveResult.rows[0]);
+    const leaveResult = await transaction.request()
+      .input('id', sql.Int, req.params.id)
+      .query('SELECT * FROM leaves WHERE id = @id');
+    
+    console.log('Leave request found:', leaveResult.recordset[0]);
 
-    if (leaveResult.rows.length === 0) {
+    if (leaveResult.recordset.length === 0) {
       console.log('Leave request not found');
-      await client.query('ROLLBACK');
+      await transaction.rollback();
       return res.status(404).json({ success: false, message: 'Leave request not found' });
     }
 
-    const leave = leaveResult.rows[0];
+    const leave = leaveResult.recordset[0];
     console.log('Current leave status:', leave.status);
 
     // Check if leave is already cancelled
     if (leave.status === 'Cancelled') {
       console.log('Leave already cancelled');
-      await client.query('ROLLBACK');
+      await transaction.rollback();
       return res.status(400).json({ success: false, message: 'Leave request is already cancelled' });
     }
 
@@ -1108,31 +1076,41 @@ app.patch('/api/leaves/:id/cancel', async (req, res) => {
           break;
         default:
           console.log('Invalid leave type:', leave.type);
-          await client.query('ROLLBACK');
+          await transaction.rollback();
           return res.status(400).json({ success: false, message: 'Invalid leave type' });
       }
 
       // Restore leave balance
       console.log('Restoring balance for column:', balanceColumn);
-      await client.query(
-        `UPDATE employees 
-         SET ${balanceColumn} = ${balanceColumn} + $1 
-         WHERE employee_id = $2`,
-        [leave.days, leave.employee_id]
-      );
+      await transaction.request()
+        .input('days', sql.Int, leave.days)
+        .input('employee_id', sql.VarChar, leave.employee_id)
+        .query(`
+          UPDATE employees 
+          SET ${balanceColumn} = ${balanceColumn} + @days 
+          WHERE employee_id = @employee_id
+        `);
     }
 
     // Update leave status to cancelled
     console.log('Updating leave status to Cancelled...');
-    const updateResult = await client.query(
-      'UPDATE leaves SET status = $1, remarks = $2, cancelled_date = $3 WHERE id::text = $4 RETURNING *',
-      ['Cancelled', 'Cancelled by employee', new Date(), req.params.id]
-    );
-    console.log('Leave updated:', updateResult.rows[0]);
+    const updateResult = await transaction.request()
+      .input('status', sql.VarChar, 'Cancelled')
+      .input('remarks', sql.VarChar, 'Cancelled by employee')
+      .input('cancelled_date', sql.DateTime, new Date())
+      .input('id', sql.Int, req.params.id)
+      .query(`
+        UPDATE leaves 
+        SET status = @status, remarks = @remarks, cancelled_date = @cancelled_date 
+        OUTPUT INSERTED.*
+        WHERE id = @id
+      `);
+    
+    console.log('Leave updated:', updateResult.recordset[0]);
 
-    await client.query('COMMIT');
+    await transaction.commit();
     console.log('Transaction committed successfully');
-    res.json({ success: true, leave: updateResult.rows[0] });
+    res.json({ success: true, leave: updateResult.recordset[0] });
   } catch (err) {
     console.error('Error in cancel leave:', err);
     console.error('Error details:', {
@@ -1141,10 +1119,8 @@ app.patch('/api/leaves/:id/cancel', async (req, res) => {
       code: err.code,
       detail: err.detail
     });
-    await client.query('ROLLBACK');
+    await transaction.rollback();
     res.status(500).json({ success: false, message: err.message });
-  } finally {
-    client.release();
   }
 });
 
@@ -1154,45 +1130,61 @@ app.post('/api/leaves/:id/request-cancellation', async (req, res) => {
   try {
     const leaveId = req.params.id;
     const { employee_id, cancel_reason } = req.body;
+    
     // Check leave exists and is approved
-    const leaveResult = await pool.query(
-      'SELECT * FROM leaves WHERE id::text = $1 AND employee_id = $2',
-      [leaveId, employee_id]
-    );
-    if (leaveResult.rows.length === 0) {
+    const leaveResult = await pool.request()
+      .input('leaveId', sql.Int, leaveId)
+      .input('employee_id', sql.VarChar, employee_id)
+      .query('SELECT * FROM leaves WHERE id = @leaveId AND employee_id = @employee_id');
+    
+    if (leaveResult.recordset.length === 0) {
       return res.status(404).json({ error: 'Leave not found' });
     }
-    const leave = leaveResult.rows[0];
+    
+    const leave = leaveResult.recordset[0];
     if ((leave.status || '').toLowerCase() !== 'approved') {
       return res.status(400).json({ error: 'Only approved leaves can be cancelled' });
     }
+    
     if ((leave.cancel_request_status || '').toLowerCase() === 'pending') {
       return res.status(400).json({ error: 'Cancellation already requested' });
     }
+    
     // Mark leave as cancellation requested
-    await pool.query(
-      `UPDATE leaves SET cancel_request_status = $1, cancel_reason = $2 WHERE id::text = $3`,
-      ['Pending', cancel_reason || '', leaveId]
-    );
-    // Notify admin/manager with sender information (set sender_name and sender_photo to employee info, append [App]/[Web] based on x-source)
-    const empInfo = await pool.query('SELECT full_name, profile_photo FROM employees WHERE employee_id = $1', [employee_id]);
-    let empName = empInfo.rows[0]?.full_name || 'Employee';
-    const empPhoto = empInfo.rows[0]?.profile_photo || null;
+    await pool.request()
+      .input('cancel_request_status', sql.VarChar, 'Pending')
+      .input('cancel_reason', sql.VarChar, cancel_reason || '')
+      .input('leaveId', sql.Int, leaveId)
+      .query(`
+        UPDATE leaves 
+        SET cancel_request_status = @cancel_request_status, cancel_reason = @cancel_reason 
+        WHERE id = @leaveId
+      `);
+    
+    // Notify admin/manager with sender information
+    const empInfo = await pool.request()
+      .input('employee_id', sql.VarChar, employee_id)
+      .query('SELECT full_name, profile_photo FROM employees WHERE employee_id = @employee_id');
+    
+    let empName = empInfo.recordset[0]?.full_name || 'Employee';
+    const empPhoto = empInfo.recordset[0]?.profile_photo || null;
     const source = req.headers['x-source'] === 'app' ? 'App' : 'Web';
+    
     if (!/\[(App|Web)\]$/.test(empName)) {
       empName = empName + ` [${source}]`;
     }
-    await pool.query(
-      `INSERT INTO notifications (type, message, user_id, sender_id, sender_name, sender_photo, created_at) 
-       VALUES ($1, $2, NULL, $3, $4, $5, CURRENT_TIMESTAMP)`,
-      [
-        'leave_cancellation_requested',
-        `Employee ${employee_id} requested cancellation for leave ${leaveId}`,
-        employee_id,
-        empName,
-        empPhoto
-      ]
-    );
+    
+    await pool.request()
+      .input('type', sql.VarChar, 'leave_cancellation_requested')
+      .input('message', sql.VarChar, `Employee ${employee_id} requested cancellation for leave ${leaveId}`)
+      .input('sender_id', sql.VarChar, employee_id)
+      .input('sender_name', sql.VarChar, empName)
+      .input('sender_photo', sql.VarChar, empPhoto)
+      .query(`
+        INSERT INTO notifications (type, message, user_id, sender_id, sender_name, sender_photo, created_at) 
+        VALUES (@type, @message, NULL, @sender_id, @sender_name, @sender_photo, GETDATE())
+      `);
+    
     res.json({ success: true, message: 'Cancellation request submitted' });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1203,20 +1195,32 @@ app.post('/api/leaves/:id/request-cancellation', async (req, res) => {
 app.post('/api/leaves/:id/approve-cancellation', async (req, res) => {
   try {
     const leaveId = req.params.id;
+    
     // Find leave
-    const leaveResult = await pool.query('SELECT * FROM leaves WHERE id::text = $1', [leaveId]);
-    if (leaveResult.rows.length === 0) {
+    const leaveResult = await pool.request()
+      .input('leaveId', sql.Int, leaveId)
+      .query('SELECT * FROM leaves WHERE id = @leaveId');
+    
+    if (leaveResult.recordset.length === 0) {
       return res.status(404).json({ error: 'Leave not found' });
     }
-    const leave = leaveResult.rows[0];
+    
+    const leave = leaveResult.recordset[0];
     if ((leave.cancel_request_status || '').toLowerCase() !== 'pending') {
       return res.status(400).json({ error: 'No pending cancellation request' });
     }
+    
     // Set leave as cancelled
-    await pool.query(
-      `UPDATE leaves SET status = $1, cancel_request_status = $2, cancelled_date = CURRENT_TIMESTAMP WHERE id::text = $3`,
-      ['Cancelled', 'Approved', leaveId]
-    );
+    await pool.request()
+      .input('status', sql.VarChar, 'Cancelled')
+      .input('cancel_request_status', sql.VarChar, 'Approved')
+      .input('leaveId', sql.Int, leaveId)
+      .query(`
+        UPDATE leaves 
+        SET status = @status, cancel_request_status = @cancel_request_status, cancelled_date = GETDATE() 
+        WHERE id = @leaveId
+      `);
+    
     // Restore leave balance
     let balanceColumn = '';
     switch ((leave.type || '').toUpperCase()) {
@@ -1224,32 +1228,43 @@ app.post('/api/leaves/:id/approve-cancellation', async (req, res) => {
       case 'EL': balanceColumn = 'el_balance'; break;
       case 'RH': balanceColumn = 'rh_balance'; break;
     }
+    
     if (balanceColumn) {
-      await pool.query(
-        `UPDATE employees SET ${balanceColumn} = ${balanceColumn} + $1 WHERE employee_id = $2`,
-        [leave.days, leave.employee_id]
-      );
+      await pool.request()
+        .input('days', sql.Int, leave.days)
+        .input('employee_id', sql.VarChar, leave.employee_id)
+        .query(`
+          UPDATE employees 
+          SET ${balanceColumn} = ${balanceColumn} + @days 
+          WHERE employee_id = @employee_id
+        `);
     }
-    // Notify employee with sender information (set sender_name and sender_photo to employee info, append [App]/[Web] based on x-source)
-    const empInfo = await pool.query('SELECT full_name, profile_photo FROM employees WHERE employee_id = $1', [leave.employee_id]);
-    let empName = empInfo.rows[0]?.full_name || 'Employee';
-    const empPhoto = empInfo.rows[0]?.profile_photo || null;
+    
+    // Notify employee with sender information
+    const empInfo = await pool.request()
+      .input('employee_id', sql.VarChar, leave.employee_id)
+      .query('SELECT full_name, profile_photo FROM employees WHERE employee_id = @employee_id');
+    
+    let empName = empInfo.recordset[0]?.full_name || 'Employee';
+    const empPhoto = empInfo.recordset[0]?.profile_photo || null;
     const source = req.headers['x-source'] === 'app' ? 'App' : 'Web';
+    
     if (!/\[(App|Web)\]$/.test(empName)) {
       empName = empName + ` [${source}]`;
     }
-    await pool.query(
-      `INSERT INTO notifications (type, message, user_id, sender_id, sender_name, sender_photo, created_at) 
-       VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)`,
-      [
-        'leave_cancellation_approved',
-        `Your leave cancellation for leave ${leaveId} was approved`,
-        leave.employee_id,
-        leave.employee_id,
-        empName,
-        empPhoto
-      ]
-    );
+    
+    await pool.request()
+      .input('type', sql.VarChar, 'leave_cancellation_approved')
+      .input('message', sql.VarChar, `Your leave cancellation for leave ${leaveId} was approved`)
+      .input('user_id', sql.VarChar, leave.employee_id)
+      .input('sender_id', sql.VarChar, leave.employee_id)
+      .input('sender_name', sql.VarChar, empName)
+      .input('sender_photo', sql.VarChar, empPhoto)
+      .query(`
+        INSERT INTO notifications (type, message, user_id, sender_id, sender_name, sender_photo, created_at) 
+        VALUES (@type, @message, @user_id, @sender_id, @sender_name, @sender_photo, GETDATE())
+      `);
+    
     res.json({ success: true, message: 'Leave cancellation approved and leave cancelled' });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1261,40 +1276,57 @@ app.post('/api/leaves/:id/reject-cancellation', async (req, res) => {
   try {
     const leaveId = req.params.id;
     const { remarks } = req.body;
+    
     // Find leave
-    const leaveResult = await pool.query('SELECT * FROM leaves WHERE id::text = $1', [leaveId]);
-    if (leaveResult.rows.length === 0) {
+    const leaveResult = await pool.request()
+      .input('leaveId', sql.Int, leaveId)
+      .query('SELECT * FROM leaves WHERE id = @leaveId');
+    
+    if (leaveResult.recordset.length === 0) {
       return res.status(404).json({ error: 'Leave not found' });
     }
-    const leave = leaveResult.rows[0];
+    
+    const leave = leaveResult.recordset[0];
     if ((leave.cancel_request_status || '').toLowerCase() !== 'pending') {
       return res.status(400).json({ error: 'No pending cancellation request' });
     }
+    
     // Revert cancellation request
-    await pool.query(
-      `UPDATE leaves SET cancel_request_status = $1, cancel_reason = $2 WHERE id::text = $3`,
-      ['Rejected', remarks || '', leaveId]
-    );
-    // Notify employee with sender information (set sender_name and sender_photo to employee info, append [App]/[Web] based on x-source)
-    const empInfo = await pool.query('SELECT full_name, profile_photo FROM employees WHERE employee_id = $1', [leave.employee_id]);
-    let empName = empInfo.rows[0]?.full_name || 'Employee';
-    const empPhoto = empInfo.rows[0]?.profile_photo || null;
+    await pool.request()
+      .input('cancel_request_status', sql.VarChar, 'Rejected')
+      .input('cancel_reason', sql.VarChar, remarks || '')
+      .input('leaveId', sql.Int, leaveId)
+      .query(`
+        UPDATE leaves 
+        SET cancel_request_status = @cancel_request_status, cancel_reason = @cancel_reason 
+        WHERE id = @leaveId
+      `);
+    
+    // Notify employee with sender information
+    const empInfo = await pool.request()
+      .input('employee_id', sql.VarChar, leave.employee_id)
+      .query('SELECT full_name, profile_photo FROM employees WHERE employee_id = @employee_id');
+    
+    let empName = empInfo.recordset[0]?.full_name || 'Employee';
+    const empPhoto = empInfo.recordset[0]?.profile_photo || null;
     const source = req.headers['x-source'] === 'app' ? 'App' : 'Web';
+    
     if (!/\[(App|Web)\]$/.test(empName)) {
       empName = empName + ` [${source}]`;
     }
-    await pool.query(
-      `INSERT INTO notifications (type, message, user_id, sender_id, sender_name, sender_photo, created_at) 
-       VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)`,
-      [
-        'leave_cancellation_rejected',
-        `Your leave cancellation for leave ${leaveId} was rejected. ${remarks || ''}`,
-        leave.employee_id,
-        leave.employee_id,
-        empName,
-        empPhoto
-      ]
-    );
+    
+    await pool.request()
+      .input('type', sql.VarChar, 'leave_cancellation_rejected')
+      .input('message', sql.VarChar, `Your leave cancellation for leave ${leaveId} was rejected. ${remarks || ''}`)
+      .input('user_id', sql.VarChar, leave.employee_id)
+      .input('sender_id', sql.VarChar, leave.employee_id)
+      .input('sender_name', sql.VarChar, empName)
+      .input('sender_photo', sql.VarChar, empPhoto)
+      .query(`
+        INSERT INTO notifications (type, message, user_id, sender_id, sender_name, sender_photo, created_at) 
+        VALUES (@type, @message, @user_id, @sender_id, @sender_name, @sender_photo, GETDATE())
+      `);
+    
     res.json({ success: true, message: 'Leave cancellation rejected' });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1308,16 +1340,18 @@ app.post('/api/leaves/:id/reject-cancellation', async (req, res) => {
 app.get('/api/notifications/:userId', async (req, res) => {
   try {
     const { userId } = req.params;
-    const result = await pool.query(`
-      SELECT n.*, 
-             n.sender_name as sender_full_name,
-             n.sender_photo as sender_profile_photo
-      FROM notifications n
-      WHERE n.user_id = $1 
-      ORDER BY n.created_at DESC 
-      LIMIT 50
-    `, [userId]);
-    res.json(result.rows);
+    const result = await pool.request()
+      .input('userId', sql.VarChar, userId)
+      .query(`
+        SELECT n.*, 
+               n.sender_name as sender_full_name,
+               n.sender_photo as sender_profile_photo
+        FROM notifications n
+        WHERE n.user_id = @userId 
+        ORDER BY n.created_at DESC 
+        OFFSET 0 ROWS FETCH NEXT 50 ROWS ONLY
+      `);
+    res.json(result.recordset);
   } catch (err) {
     console.error('Error fetching user notifications:', err);
     res.status(500).json({ error: err.message });
@@ -1327,16 +1361,16 @@ app.get('/api/notifications/:userId', async (req, res) => {
 // Get notifications for admin/global
 app.get('/api/notifications', async (req, res) => {
   try {
-    const result = await pool.query(`
+    const result = await pool.request().query(`
       SELECT n.*, 
              n.sender_name as sender_full_name,
              n.sender_photo as sender_profile_photo
       FROM notifications n
       WHERE n.user_id IS NULL 
       ORDER BY n.created_at DESC 
-      LIMIT 50
+      OFFSET 0 ROWS FETCH NEXT 50 ROWS ONLY
     `);
-    res.json(result.rows);
+    res.json(result.recordset);
   } catch (err) {
     console.error('Error fetching notifications:', err);
     res.status(500).json({ error: err.message });
@@ -1346,7 +1380,9 @@ app.get('/api/notifications', async (req, res) => {
 // Mark notification as read
 app.patch('/api/notifications/:id/read', async (req, res) => {
   try {
-    await pool.query('UPDATE notifications SET is_read = TRUE WHERE id = $1', [req.params.id]);
+    await pool.request()
+      .input('id', sql.Int, req.params.id)
+      .query('UPDATE notifications SET is_read = 1 WHERE id = @id');
     res.json({ success: true });
   } catch (err) {
     console.error('Error marking notification as read:', err);
@@ -1359,18 +1395,14 @@ app.get('/api/employees/:employeeId', async (req, res) => {
   try {
     const { employeeId } = req.params;
     console.log('Fetching employee profile for ID:', employeeId);
-    
-    const result = await pool.query(
-      'SELECT * FROM employees WHERE LOWER(employee_id) = LOWER($1)',
-      [employeeId]
-    );
-    
-    if (result.rows.length === 0) {
+    const result = await pool.request()
+      .input('employeeId', sql.VarChar, employeeId)
+      .query('SELECT * FROM employees WHERE LOWER(employee_id) = LOWER(@employeeId)');
+    if (!result.recordset.length) {
       console.log('Employee not found for ID:', employeeId);
       return res.status(404).json({ error: 'Employee not found' });
     }
-    
-    const employee = result.rows[0];
+    const employee = result.recordset[0];
     console.log('Employee data found:', {
       employee_id: employee.employee_id,
       full_name: employee.full_name,
@@ -1378,7 +1410,6 @@ app.get('/api/employees/:employeeId', async (req, res) => {
       designation: employee.designation,
       email: employee.email
     });
-    
     res.json(employee);
   } catch (err) {
     console.error('Error fetching employee:', err);
@@ -1399,23 +1430,24 @@ app.post('/api/employees/upload_profile_photo', uploadProfilePhoto.single('photo
     const profilePhotoUrl = `/uploads/profile_photos/${req.file.filename}`;
 
     // Get the old photo filename (if any)
-    const oldPhotoResult = await pool.query(
-      'SELECT profile_photo FROM employees WHERE employee_id = $1',
-      [employee_id]
-    );
-    if (oldPhotoResult.rows.length > 0 && oldPhotoResult.rows[0].profile_photo) {
-      const oldPhotoPath = oldPhotoResult.rows[0].profile_photo;
+    const oldPhotoResult = await pool.request()
+      .input('employee_id', sql.VarChar, employee_id)
+      .query('SELECT profile_photo FROM employees WHERE employee_id = @employee_id');
+    
+    if (oldPhotoResult.recordset.length > 0 && oldPhotoResult.recordset[0].profile_photo) {
+      const oldPhotoPath = oldPhotoResult.recordset[0].profile_photo;
       // Only delete if the old photo is not the same as the new one and is not null/empty
       if (oldPhotoPath && oldPhotoPath !== profilePhotoUrl) {
         const fullOldPath = path.join(__dirname, oldPhotoPath.replace(/^\//, ''));
         // Only delete if file exists and is not used by any other user
         try {
           // Check if any other user is using this photo
-          const otherUserResult = await pool.query(
-            'SELECT COUNT(*) FROM employees WHERE profile_photo = $1 AND employee_id != $2',
-            [oldPhotoPath, employee_id]
-          );
-          if (parseInt(otherUserResult.rows[0].count) === 0 && fs.existsSync(fullOldPath)) {
+          const otherUserResult = await pool.request()
+            .input('oldPhotoPath', sql.VarChar, oldPhotoPath)
+            .input('employee_id', sql.VarChar, employee_id)
+            .query('SELECT COUNT(*) as count FROM employees WHERE profile_photo = @oldPhotoPath AND employee_id != @employee_id');
+          
+          if (parseInt(otherUserResult.recordset[0].count) === 0 && fs.existsSync(fullOldPath)) {
             fs.unlinkSync(fullOldPath);
           }
         } catch (e) {
@@ -1425,10 +1457,10 @@ app.post('/api/employees/upload_profile_photo', uploadProfilePhoto.single('photo
     }
 
     // Save the new photo URL to the database
-    await pool.query(
-      'UPDATE employees SET profile_photo = $1 WHERE employee_id = $2',
-      [profilePhotoUrl, employee_id]
-    );
+    await pool.request()
+      .input('profile_photo', sql.VarChar, profilePhotoUrl)
+      .input('employee_id', sql.VarChar, employee_id)
+      .query('UPDATE employees SET profile_photo = @profile_photo WHERE employee_id = @employee_id');
 
     res.json({
       success: true,
@@ -1447,33 +1479,30 @@ app.delete('/api/employees/:employeeId/profile-photo', async (req, res) => {
     const { employeeId } = req.params;
 
     // Get the current photo path
-    const photoResult = await pool.query(
-      'SELECT profile_photo FROM employees WHERE employee_id = $1',
-      [employeeId]
-    );
+    const photoResult = await pool.request()
+      .input('employeeId', sql.VarChar, employeeId)
+      .query('SELECT profile_photo FROM employees WHERE employee_id = @employeeId');
 
-    if (photoResult.rows.length === 0) {
+    if (photoResult.recordset.length === 0) {
       return res.status(404).json({ error: 'Employee not found' });
     }
 
-    const currentPhotoPath = photoResult.rows[0].profile_photo;
+    const currentPhotoPath = photoResult.recordset[0].profile_photo;
 
     // Remove photo from database
-    await pool.query(
-      'UPDATE employees SET profile_photo = NULL WHERE employee_id = $1',
-      [employeeId]
-    );
+    await pool.request()
+      .input('employeeId', sql.VarChar, employeeId)
+      .query('UPDATE employees SET profile_photo = NULL WHERE employee_id = @employeeId');
 
     // Delete physical file if it exists and no other user is using it
     if (currentPhotoPath) {
       try {
         // Check if any other user is using this photo
-        const otherUserResult = await pool.query(
-          'SELECT COUNT(*) FROM employees WHERE profile_photo = $1',
-          [currentPhotoPath]
-        );
+        const otherUserResult = await pool.request()
+          .input('currentPhotoPath', sql.VarChar, currentPhotoPath)
+          .query('SELECT COUNT(*) as count FROM employees WHERE profile_photo = @currentPhotoPath');
         
-        if (parseInt(otherUserResult.rows[0].count) === 0) {
+        if (parseInt(otherUserResult.recordset[0].count) === 0) {
           const fullPhotoPath = path.join(__dirname, currentPhotoPath.replace(/^\//, ''));
           if (fs.existsSync(fullPhotoPath)) {
             fs.unlinkSync(fullPhotoPath);
@@ -1504,20 +1533,21 @@ app.patch('/api/employees/:employeeId/profile-photo', uploadProfilePhoto.single(
     const profilePhotoUrl = `/uploads/profile_photos/${req.file.filename}`;
 
     // Get the old photo filename (if any)
-    const oldPhotoResult = await pool.query(
-      'SELECT profile_photo FROM employees WHERE employee_id = $1',
-      [employeeId]
-    );
-    if (oldPhotoResult.rows.length > 0 && oldPhotoResult.rows[0].profile_photo) {
-      const oldPhotoPath = oldPhotoResult.rows[0].profile_photo;
+    const oldPhotoResult = await pool.request()
+      .input('employeeId', sql.VarChar, employeeId)
+      .query('SELECT profile_photo FROM employees WHERE employee_id = @employeeId');
+    
+    if (oldPhotoResult.recordset.length > 0 && oldPhotoResult.recordset[0].profile_photo) {
+      const oldPhotoPath = oldPhotoResult.recordset[0].profile_photo;
       if (oldPhotoPath && oldPhotoPath !== profilePhotoUrl) {
         const fullOldPath = path.join(__dirname, oldPhotoPath.replace(/^\//, ''));
         try {
-          const otherUserResult = await pool.query(
-            'SELECT COUNT(*) FROM employees WHERE profile_photo = $1 AND employee_id != $2',
-            [oldPhotoPath, employeeId]
-          );
-          if (parseInt(otherUserResult.rows[0].count) === 0 && fs.existsSync(fullOldPath)) {
+          const otherUserResult = await pool.request()
+            .input('oldPhotoPath', sql.VarChar, oldPhotoPath)
+            .input('employeeId', sql.VarChar, employeeId)
+            .query('SELECT COUNT(*) as count FROM employees WHERE profile_photo = @oldPhotoPath AND employee_id != @employeeId');
+          
+          if (parseInt(otherUserResult.recordset[0].count) === 0 && fs.existsSync(fullOldPath)) {
             fs.unlinkSync(fullOldPath);
           }
         } catch (e) {
@@ -1527,10 +1557,10 @@ app.patch('/api/employees/:employeeId/profile-photo', uploadProfilePhoto.single(
     }
 
     // Save the new photo URL to the database
-    await pool.query(
-      'UPDATE employees SET profile_photo = $1 WHERE employee_id = $2',
-      [profilePhotoUrl, employeeId]
-    );
+    await pool.request()
+      .input('profile_photo', sql.VarChar, profilePhotoUrl)
+      .input('employeeId', sql.VarChar, employeeId)
+      .query('UPDATE employees SET profile_photo = @profile_photo WHERE employee_id = @employeeId');
 
     // Build absolute URL for frontend
     const fullUrl = `${req.protocol}://${req.get('host')}${profilePhotoUrl}`;
@@ -1581,34 +1611,33 @@ app.get('/api/user/leave-stats', async (req, res) => {
     }
 
     // Get total leaves
-    const totalResult = await pool.query(
-      'SELECT COUNT(*) as total FROM leaves WHERE employee_id = $1',
-      [employee_id]
-    );
+    const totalResult = await pool.request()
+      .input('employee_id', sql.VarChar, employee_id)
+      .query('SELECT COUNT(*) as total FROM leaves WHERE employee_id = @employee_id');
 
     // Get approved leaves
-    const approvedResult = await pool.query(
-      'SELECT COUNT(*) as approved FROM leaves WHERE employee_id = $1 AND status = $2',
-      [employee_id, 'Approved']
-    );
+    const approvedResult = await pool.request()
+      .input('employee_id', sql.VarChar, employee_id)
+      .input('status', sql.VarChar, 'Approved')
+      .query('SELECT COUNT(*) as approved FROM leaves WHERE employee_id = @employee_id AND status = @status');
 
     // Get pending leaves
-    const pendingResult = await pool.query(
-      'SELECT COUNT(*) as pending FROM leaves WHERE employee_id = $1 AND status = $2',
-      [employee_id, 'Pending']
-    );
+    const pendingResult = await pool.request()
+      .input('employee_id', sql.VarChar, employee_id)
+      .input('status', sql.VarChar, 'Pending')
+      .query('SELECT COUNT(*) as pending FROM leaves WHERE employee_id = @employee_id AND status = @status');
 
     // Get rejected leaves
-    const rejectedResult = await pool.query(
-      'SELECT COUNT(*) as rejected FROM leaves WHERE employee_id = $1 AND status = $2',
-      [employee_id, 'Rejected']
-    );
+    const rejectedResult = await pool.request()
+      .input('employee_id', sql.VarChar, employee_id)
+      .input('status', sql.VarChar, 'Rejected')
+      .query('SELECT COUNT(*) as rejected FROM leaves WHERE employee_id = @employee_id AND status = @status');
 
     res.json({
-      total: parseInt(totalResult.rows[0].total),
-      approved: parseInt(approvedResult.rows[0].approved),
-      pending: parseInt(pendingResult.rows[0].pending),
-      rejected: parseInt(rejectedResult.rows[0].rejected),
+      total: parseInt(totalResult.recordset[0].total),
+      approved: parseInt(approvedResult.recordset[0].approved),
+      pending: parseInt(pendingResult.recordset[0].pending),
+      rejected: parseInt(rejectedResult.recordset[0].rejected),
     });
   } catch (err) {
     console.error('Error fetching leave stats:', err);
@@ -1726,25 +1755,24 @@ app.put('/api/user/password', async (req, res) => {
     }
 
     // First verify current password
-    const userResult = await pool.query(
-      'SELECT password FROM employees WHERE employee_id = $1',
-      [employee_id]
-    );
+    const userResult = await pool.request()
+      .input('employee_id', sql.VarChar, employee_id)
+      .query('SELECT password FROM employees WHERE employee_id = @employee_id');
 
-    if (userResult.rows.length === 0) {
+    if (userResult.recordset.length === 0) {
       return res.status(404).json({ error: 'Employee not found' });
     }
 
-    const currentStoredPassword = userResult.rows[0].password;
+    const currentStoredPassword = userResult.recordset[0].password;
     if (currentStoredPassword !== currentPassword) {
       return res.status(400).json({ error: 'Current password is incorrect' });
     }
 
     // Update password
-    await pool.query(
-      'UPDATE employees SET password = $1 WHERE employee_id = $2',
-      [newPassword, employee_id]
-    );
+    await pool.request()
+      .input('newPassword', sql.VarChar, newPassword)
+      .input('employee_id', sql.VarChar, employee_id)
+      .query('UPDATE employees SET password = @newPassword WHERE employee_id = @employee_id');
 
     res.json({ 
       success: true, 
@@ -1766,52 +1794,56 @@ app.put('/api/employees/profile', async (req, res) => {
 
     // Build dynamic update query
     const updateFields = [];
-    const updateValues = [];
+    const inputs = [];
     let paramCount = 1;
 
     if (full_name !== undefined) {
-      updateFields.push(`full_name = $${paramCount++}`);
-      updateValues.push(full_name);
+      updateFields.push(`full_name = @param${paramCount++}`);
+      inputs.push({ name: `param${paramCount-1}`, type: sql.VarChar, value: full_name });
     }
     if (email !== undefined) {
-      updateFields.push(`email = $${paramCount++}`);
-      updateValues.push(email);
+      updateFields.push(`email = @param${paramCount++}`);
+      inputs.push({ name: `param${paramCount-1}`, type: sql.VarChar, value: email });
     }
     if (phone !== undefined) {
-      updateFields.push(`mobile_number = $${paramCount++}`);
-      updateValues.push(phone);
+      updateFields.push(`mobile_number = @param${paramCount++}`);
+      inputs.push({ name: `param${paramCount-1}`, type: sql.VarChar, value: phone });
     }
     if (department !== undefined) {
-      updateFields.push(`current_posting = $${paramCount++}`);
-      updateValues.push(department);
+      updateFields.push(`current_posting = @param${paramCount++}`);
+      inputs.push({ name: `param${paramCount-1}`, type: sql.VarChar, value: department });
     }
     if (designation !== undefined) {
-      updateFields.push(`designation = $${paramCount++}`);
-      updateValues.push(designation);
+      updateFields.push(`designation = @param${paramCount++}`);
+      inputs.push({ name: `param${paramCount-1}`, type: sql.VarChar, value: designation });
     }
 
     if (updateFields.length === 0) {
       return res.status(400).json({ error: 'No fields to update' });
     }
 
-    updateValues.push(employee_id);
+    inputs.push({ name: `param${paramCount}`, type: sql.VarChar, value: employee_id });
     const query = `
       UPDATE employees 
       SET ${updateFields.join(', ')} 
-      WHERE employee_id = $${paramCount} 
-      RETURNING *
+      OUTPUT INSERTED.*
+      WHERE employee_id = @param${paramCount}
     `;
 
-    const result = await pool.query(query, updateValues);
+    let request = pool.request();
+    for (const inp of inputs) {
+      request = request.input(inp.name, inp.type, inp.value);
+    }
+    const result = await request.query(query);
     
-    if (result.rows.length === 0) {
+    if (result.recordset.length === 0) {
       return res.status(404).json({ error: 'Employee not found' });
     }
 
     res.json({
       success: true,
       message: 'Profile updated successfully',
-      employee: result.rows[0]
+      employee: result.recordset[0]
     });
   } catch (err) {
     console.error('Error updating employee profile:', err);
@@ -1820,7 +1852,6 @@ app.put('/api/employees/profile', async (req, res) => {
 });
 
 // Cancel approved leave request
-// Cancel approved leave request (clean, no duplicate status/cancellation fields)
 app.post('/api/leaves/cancel-approved', async (req, res) => {
   try {
     const { leave_id, employee_id, cancel_reason } = req.body;
@@ -1829,14 +1860,17 @@ app.post('/api/leaves/cancel-approved', async (req, res) => {
     }
 
     // Check if the leave exists and is approved
-    const leaveCheck = await pool.query(
-      'SELECT * FROM leaves WHERE id::text = $1 AND employee_id = $2 AND status = $3',
-      [leave_id, employee_id, 'Approved']
-    );
-    if (leaveCheck.rows.length === 0) {
+    const leaveCheck = await pool.request()
+      .input('leave_id', sql.Int, leave_id)
+      .input('employee_id', sql.VarChar, employee_id)
+      .input('status', sql.VarChar, 'Approved')
+      .query('SELECT * FROM leaves WHERE id = @leave_id AND employee_id = @employee_id AND status = @status');
+    
+    if (leaveCheck.recordset.length === 0) {
       return res.status(404).json({ error: 'Leave not found or not approved. Only approved leaves can be cancelled.' });
     }
-    const leave = leaveCheck.rows[0];
+    
+    const leave = leaveCheck.recordset[0];
     const leaveStartDate = new Date(leave.start_date);
     const today = new Date();
 
@@ -1855,18 +1889,22 @@ app.post('/api/leaves/cancel-approved', async (req, res) => {
       return res.status(400).json({ error: 'Cannot cancel leave that has already started or passed' });
     }
 
-    // Update leave status to cancelled (no extra status fields)
-    const result = await pool.query(
-      `UPDATE leaves 
-       SET status = 'Cancelled', 
-           remarks = $1,
-           cancelled_date = CURRENT_TIMESTAMP,
-           updated_at = CURRENT_TIMESTAMP
-       WHERE id::text = $2 AND employee_id = $3 
-       RETURNING *`,
-      [cancel_reason || 'Cancelled by employee', leave_id, employee_id]
-    );
-    if (result.rows.length === 0) {
+    // Update leave status to cancelled
+    const result = await pool.request()
+      .input('cancel_reason', sql.VarChar, cancel_reason || 'Cancelled by employee')
+      .input('leave_id', sql.Int, leave_id)
+      .input('employee_id', sql.VarChar, employee_id)
+      .query(`
+        UPDATE leaves 
+        SET status = 'Cancelled', 
+            remarks = @cancel_reason,
+            cancelled_date = GETDATE(),
+            updated_at = GETDATE()
+        OUTPUT INSERTED.*
+        WHERE id = @leave_id AND employee_id = @employee_id 
+      `);
+    
+    if (result.recordset.length === 0) {
       return res.status(500).json({ error: 'Failed to cancel leave' });
     }
 
@@ -1878,28 +1916,31 @@ app.post('/api/leaves/cancel-approved', async (req, res) => {
       case 'RH': balanceColumn = 'rh_balance'; break;
     }
     if (balanceColumn) {
-      await pool.query(
-        `UPDATE employees SET ${balanceColumn} = ${balanceColumn} + $1 WHERE employee_id = $2`,
-        [leave.days, employee_id]
-      );
+      await pool.request()
+        .input('days', sql.Int, leave.days)
+        .input('employee_id', sql.VarChar, employee_id)
+        .query(`
+          UPDATE employees 
+          SET ${balanceColumn} = ${balanceColumn} + @days 
+          WHERE employee_id = @employee_id
+        `);
     }
 
     // Create notification for manager
-    await pool.query(
-      `INSERT INTO notifications (type, message, user_id, sender_id, created_at) 
-       VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)`,
-      [
-        'leave_cancelled',
-        `Leave request ${leave_id} has been cancelled by employee ${employee_id}`,
-        leave.manager_id || 1,
-        employee_id
-      ]
-    );
+    await pool.request()
+      .input('type', sql.VarChar, 'leave_cancelled')
+      .input('message', sql.VarChar, `Leave request ${leave_id} has been cancelled by employee ${employee_id}`)
+      .input('user_id', sql.VarChar, leave.manager_id || '1')
+      .input('sender_id', sql.VarChar, employee_id)
+      .query(`
+        INSERT INTO notifications (type, message, user_id, sender_id, created_at) 
+        VALUES (@type, @message, @user_id, @sender_id, GETDATE())
+      `);
 
     res.json({
       success: true,
       message: 'Leave cancelled successfully',
-      leave: result.rows[0],
+      leave: result.recordset[0],
       balanceRestored: !!balanceColumn
     });
   } catch (err) {
@@ -1913,14 +1954,114 @@ app.post('/api/leaves/:id/upload-document', uploadLeaveDoc.single('document'), a
   try {
     const leaveId = req.params.id;
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    
     const fileUrl = `/uploads/leave_docs/${req.file.filename}`;
     const { originalname, size } = req.file;
-    const result = await pool.query(
-      'INSERT INTO leave_documents (leave_id, file_name, file_url, file_size) VALUES ($1, $2, $3, $4) RETURNING *',
-      [leaveId, originalname, fileUrl, size]
-    );
-    res.json({ success: true, document: result.rows[0] });
+    
+    // Check if leave exists
+    const leaveCheck = await pool.request()
+      .input('leaveId', sql.Int, leaveId)
+      .query('SELECT id FROM leaves WHERE id = @leaveId');
+    
+    if (leaveCheck.recordset.length === 0) {
+      return res.status(404).json({ error: 'Leave not found' });
+    }
+    
+    const result = await pool.request()
+      .input('leave_id', sql.Int, leaveId)
+      .input('file_name', sql.VarChar, originalname)
+      .input('file_url', sql.VarChar, fileUrl)
+      .input('file_size', sql.Int, size)
+      .query(`
+        INSERT INTO leave_documents (leave_id, file_name, file_url, file_size) 
+        OUTPUT INSERTED.*
+        VALUES (@leave_id, @file_name, @file_url, @file_size)
+      `);
+    
+    res.json({ 
+      success: true, 
+      document: result.recordset[0],
+      message: 'Document uploaded successfully'
+    });
   } catch (err) {
+    console.error('Error uploading document:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get documents for a leave
+app.get('/api/leaves/:id/documents', async (req, res) => {
+  try {
+    const leaveId = req.params.id;
+    
+    // Check if leave exists
+    const leaveCheck = await pool.request()
+      .input('leaveId', sql.Int, leaveId)
+      .query('SELECT id FROM leaves WHERE id = @leaveId');
+    
+    if (leaveCheck.recordset.length === 0) {
+      return res.status(404).json({ error: 'Leave not found' });
+    }
+    
+    const docsResult = await pool.request()
+      .input('leave_id', sql.Int, leaveId)
+      .query(`
+        SELECT id, file_name, file_url, file_size, upload_date 
+        FROM leave_documents 
+        WHERE leave_id = @leave_id 
+        ORDER BY upload_date DESC
+      `);
+    
+    res.json({
+      success: true,
+      documents: docsResult.recordset,
+      count: docsResult.recordset.length
+    });
+  } catch (err) {
+    console.error('Error fetching documents:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Delete a document
+app.delete('/api/documents/:documentId', async (req, res) => {
+  try {
+    const documentId = req.params.documentId;
+    
+    // Get document info before deleting
+    const docResult = await pool.request()
+      .input('documentId', sql.Int, documentId)
+      .query('SELECT file_url FROM leave_documents WHERE id = @documentId');
+    
+    if (docResult.recordset.length === 0) {
+      return res.status(404).json({ error: 'Document not found' });
+    }
+    
+    const fileUrl = docResult.recordset[0].file_url;
+    
+    // Delete from database
+    await pool.request()
+      .input('documentId', sql.Int, documentId)
+      .query('DELETE FROM leave_documents WHERE id = @documentId');
+    
+    // Delete physical file
+    if (fileUrl) {
+      try {
+        const fullPath = path.join(__dirname, fileUrl.replace(/^\//, ''));
+        if (fs.existsSync(fullPath)) {
+          fs.unlinkSync(fullPath);
+        }
+      } catch (e) {
+        console.error('Error deleting physical file:', e);
+      }
+    }
+    
+    res.json({ 
+      success: true, 
+      message: 'Document deleted successfully' 
+    });
+  } catch (err) {
+    console.error('Error deleting document:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -1928,13 +2069,34 @@ app.post('/api/leaves/:id/upload-document', uploadLeaveDoc.single('document'), a
 // Update leave details API to include documents
 app.get('/api/leaves/:id/details', async (req, res) => {
   try {
-    const leaveResult = await pool.query('SELECT * FROM leaves WHERE id::text = $1', [req.params.id]);
-    if (leaveResult.rows.length === 0) return res.status(404).json({ error: 'Leave not found' });
-    const leave = leaveResult.rows[0];
-    const docsResult = await pool.query('SELECT file_name, file_url, file_size, upload_date FROM leave_documents WHERE leave_id = $1', [req.params.id]);
-    leave.documents = docsResult.rows;
-    res.json(leave);
+    const leaveResult = await pool.request()
+      .input('id', sql.Int, req.params.id)
+      .query('SELECT * FROM leaves WHERE id = @id');
+    
+    if (leaveResult.recordset.length === 0) {
+      return res.status(404).json({ error: 'Leave not found' });
+    }
+    
+    const leave = leaveResult.recordset[0];
+    
+    // Get documents for this leave
+    const docsResult = await pool.request()
+      .input('leave_id', sql.Int, req.params.id)
+      .query(`
+        SELECT id, file_name, file_url, file_size, upload_date 
+        FROM leave_documents 
+        WHERE leave_id = @leave_id 
+        ORDER BY upload_date DESC
+      `);
+    
+    leave.documents = docsResult.recordset;
+    
+    res.json({
+      success: true,
+      leave: leave
+    });
   } catch (err) {
+    console.error('Error fetching leave details:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -1942,7 +2104,7 @@ app.get('/api/leaves/:id/details', async (req, res) => {
 // Get all employees with debugging info
 app.get('/api/employees/debug', async (req, res) => {
   try {
-    const result = await pool.query(`
+    const result = await pool.request().query(`
       SELECT 
         employee_id, 
         full_name, 
@@ -1953,11 +2115,10 @@ app.get('/api/employees/debug', async (req, res) => {
       FROM employees 
       ORDER BY employee_id
     `);
-    
-    console.log('All employees data:', result.rows);
+    console.log('All employees data:', result.recordset);
     res.json({
-      count: result.rows.length,
-      employees: result.rows
+      count: result.recordset.length,
+      employees: result.recordset
     });
   } catch (err) {
     console.error('Error fetching all employees:', err);
@@ -1970,30 +2131,24 @@ app.patch('/api/employees/:employeeId/fix-data', async (req, res) => {
   try {
     const { employeeId } = req.params;
     const { full_name, current_posting } = req.body;
-    
     if (!full_name || !current_posting) {
       return res.status(400).json({ 
         error: 'Both full_name and current_posting are required' 
       });
     }
-    
-    const result = await pool.query(
-      `UPDATE employees 
-       SET full_name = $1, current_posting = $2 
-       WHERE LOWER(employee_id) = LOWER($3) 
-       RETURNING employee_id, full_name, current_posting`,
-      [full_name, current_posting, employeeId]
-    );
-    
-    if (result.rows.length === 0) {
+    const result = await pool.request()
+      .input('full_name', sql.VarChar, full_name)
+      .input('current_posting', sql.VarChar, current_posting)
+      .input('employeeId', sql.VarChar, employeeId)
+      .query(`UPDATE employees SET full_name = @full_name, current_posting = @current_posting OUTPUT INSERTED.employee_id, INSERTED.full_name, INSERTED.current_posting WHERE LOWER(employee_id) = LOWER(@employeeId)`);
+    if (!result.recordset.length) {
       return res.status(404).json({ error: 'Employee not found' });
     }
-    
-    console.log('Updated employee data:', result.rows[0]);
+    console.log('Updated employee data:', result.recordset[0]);
     res.json({
       success: true,
       message: 'Employee data updated successfully',
-      employee: result.rows[0]
+      employee: result.recordset[0]
     });
   } catch (err) {
     console.error('Error updating employee data:', err);
@@ -2006,8 +2161,11 @@ app.delete('/api/notifications/:userId/clear', async (req, res) => {
   try {
     const { userId } = req.params;
     console.log('Clear notifications for userId:', userId);
-    const result = await pool.query('DELETE FROM notifications WHERE user_id = $1', [userId]);
-    console.log('Rows deleted:', result.rowCount);
+    const result = await pool.request()
+      .input('userId', sql.VarChar, userId)
+      .query('DELETE FROM notifications WHERE user_id = @userId');
+    
+    console.log('Rows deleted:', result.rowsAffected[0]);
     res.json({ success: true, message: 'All notifications cleared' });
   } catch (err) {
     console.error('Error clearing notifications:', err);
@@ -2023,25 +2181,29 @@ app.post('/api/notifications/test', async (req, res) => {
     // Get sender information
     let senderInfo = { full_name: 'System', profile_photo: null };
     if (sender_id) {
-      const senderResult = await pool.query(
-        'SELECT full_name, profile_photo FROM employees WHERE employee_id = $1',
-        [sender_id]
-      );
-      if (senderResult.rows.length > 0) {
-        senderInfo = senderResult.rows[0];
+      const senderResult = await pool.request()
+        .input('sender_id', sql.VarChar, sender_id)
+        .query('SELECT full_name, profile_photo FROM employees WHERE employee_id = @sender_id');
+      
+      if (senderResult.recordset.length > 0) {
+        senderInfo = senderResult.recordset[0];
       }
     }
     
-    const result = await pool.query(
-      `INSERT INTO notifications (type, message, user_id, sender_id, created_at) 
-       VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP) 
-       RETURNING *`,
-      ['test', message, user_id, sender_id]
-    );
+    const result = await pool.request()
+      .input('type', sql.VarChar, 'test')
+      .input('message', sql.VarChar, message)
+      .input('user_id', sql.VarChar, user_id)
+      .input('sender_id', sql.VarChar, sender_id)
+      .query(`
+        INSERT INTO notifications (type, message, user_id, sender_id, created_at) 
+        OUTPUT INSERTED.*
+        VALUES (@type, @message, @user_id, @sender_id, GETDATE())
+      `);
     
     res.json({
       success: true,
-      notification: result.rows[0]
+      notification: result.recordset[0]
     });
   } catch (err) {
     console.error('Error creating test notification:', err);
@@ -2106,3 +2268,50 @@ app.get('/api/system/health', (req, res) => {
     timestamp: new Date().toISOString()
   });
 });
+
+// System Health Endpoint for Admin Panel
+app.get('/api/system/health', async (req, res) => {
+  try {
+    // Uptime in seconds
+    const uptime = process.uptime();
+    // Memory usage in percent
+    const memoryUsage = process.memoryUsage();
+    const totalMem = process.env.TOTAL_MEM_MB ? parseInt(process.env.TOTAL_MEM_MB) * 1024 * 1024 : require('os').totalmem();
+    const usedMem = memoryUsage.rss;
+    const memoryPercent = totalMem ? (usedMem / totalMem) * 100 : 0;
+    // CPU usage (not always available, so set to 0 for simplicity)
+    let cpuPercent = 0;
+    // Optionally, you can use os-utils or pidusage for more accurate CPU, but for now keep it simple
+    res.json({
+      uptime: Math.round(uptime),
+      memory: { percent: Math.round(memoryPercent) },
+      cpu: { percent: Math.round(cpuPercent) }
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to get system health', details: err.message });
+  }
+});
+
+// Middleware to block leave endpoints for admin users
+function blockAdminLeave(req, res, next) {
+  // user info is usually attached to req.user after authentication
+  // For this codebase, user info is returned on login, but not attached to req.user by default.
+  // We'll check for employee_id in body/query and fetch role if not present.
+  const employeeId = req.body.employee_id || req.body.employeeId || req.query.employee_id || req.query.employeeId;
+  if (!employeeId) return next(); // If no employeeId, let it pass (could be admin viewing all leaves etc.)
+
+  // Fetch user role from DB
+  pool.request()
+    .input('employee_id', sql.VarChar, employeeId)
+    .query('SELECT role FROM employees WHERE employee_id = @employee_id')
+    .then(result => {
+      if (result.recordset.length && result.recordset[0].role === 'admin') {
+        return res.status(403).json({ error: 'Admin users cannot access leave features.' });
+      }
+      next();
+    })
+    .catch(() => next()); // If DB error, let it pass (fail open)
+}
+
+// Apply this middleware to all leave-related endpoints
+app.use(['/api/leaves', '/api/leaves/*'], blockAdminLeave);
